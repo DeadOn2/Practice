@@ -24,8 +24,12 @@ tts.load_checkpoint(cfg, "C:/Users/light/AppData/Local/tts/tts_models--multiling
 
 tts.eval()
 
-output_wav, gpt_latents, speaker_embedding = tts.synthesize("Тестирую тестовый текст для записи",config=cfg, speaker_wav="audio_2026-02-16_01-29-54.wav", language="ru")
-print(output_wav)
+
+out = tts.synthesize("Тестирую тестовый текст для записи",config=cfg, speaker_wav="audio_2026-02-16_01-29-54.wav", language="ru")
+
+output_wav = out["wav"]
+
+print(type(output_wav))
 wav_int16 = np.int16(output_wav * 32767)
 write("output2.wav", 24000, wav_int16)
 
