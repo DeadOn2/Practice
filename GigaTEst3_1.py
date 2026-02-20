@@ -35,7 +35,11 @@ class Config:
     batch_size = 8
     lr = 1e-4
     epochs = 100
+<<<<<<< HEAD
     device = "cuda"
+=======
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+>>>>>>> origin/main
 
 
 # --- 2. DATA PROCESSING ---
@@ -191,6 +195,7 @@ class PodcastDistillDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         audio_path = Path(sample["audio_path"])
+<<<<<<< HEAD
         # Путь к файлу с длительностями
         dur_path = audio_path.parent / f"{audio_path.stem}_durations.pt"
 
@@ -224,10 +229,35 @@ class PodcastDistillDataset(Dataset):
             print(f"Error loading {dur_path}: {e}")
             return self.__getitem__(np.random.randint(0, len(self.samples)))
 
+=======
+        dur_path = audio_path.parent / f"{audio_path.stem}_durations.pt"
+
+        # 1. Загружаем препроцессированные данные
+        if dur_path.exists():
+            data = torch.load(dur_path)
+            token_ids = data["token_ids"]
+            durations = data["durations"]
+        else:
+            # Fallback, если файл пропущен
+            return self.__getitem__(np.random.randint(0, len(self.samples)))
+
+        # 2. Обработка аудио
+        waveform = self.load_audio(str(audio_path))
+        mel_spec = self.mel_proc(waveform)
+
+        return {
+            "text_ids": torch.tensor(token_ids, dtype=torch.long),
+            "mel_target": mel_spec,
+            "durations": durations,  # <--- ДОБАВИЛИ ДЛИТЕЛЬНОСТИ
+            "audio_path": sample["audio_path"]
+        }
+
+>>>>>>> origin/main
 
 def collate_fn(batch):
     text_ids = [b['text_ids'] for b in batch]
     mels = [b['mel_target'] for b in batch]
+<<<<<<< HEAD
     durs = [b['durations'] for b in batch]
     audio_paths = [b['audio_path'] for b in batch]
 
@@ -235,11 +265,23 @@ def collate_fn(batch):
     # Используй константу тишины для мелов (зависит от твоего препроцессинга, обычно -11.51)
     mels_padded = torch.nn.utils.rnn.pad_sequence(mels, batch_first=True, padding_value=-11.51)
     durs_padded = torch.nn.utils.rnn.pad_sequence(durs, batch_first=True, padding_value=0)
+=======
+    durations = [b['durations'] for b in batch] # <--- Извлекаем
+    audio_paths = [b['audio_path'] for b in batch]
+
+    text_padded = torch.nn.utils.rnn.pad_sequence(text_ids, batch_first=True, padding_value=0)
+    mels_padded = torch.nn.utils.rnn.pad_sequence(mels, batch_first=True, padding_value=-11.51)
+    durations_padded = torch.nn.utils.rnn.pad_sequence(durations, batch_first=True, padding_value=0) # <--- Паддинг 0
+>>>>>>> origin/main
 
     return {
         "text": text_padded,
         "mel": mels_padded,
+<<<<<<< HEAD
         "durations": durs_padded,
+=======
+        "durations": durations_padded, # <--- Отдаем в батч
+>>>>>>> origin/main
         "audio_paths": audio_paths
     }
 
@@ -301,12 +343,20 @@ class StudentModel(nn.Module):
         self.mel_proj = nn.Linear(d_model, n_mels)
         self.postnet = PostNet(n_mels)
 
+<<<<<<< HEAD
 
     def forward(self, text, speaker_emb, mel_target=None, durations=None):
+=======
+        # ДОБАВЬ target_durations В АРГУМЕНТЫ
+    def forward(self, text, speaker_emb, mel_target=None, target_durations=None):
+
+        # ----- TEXT ENCODER -----
+>>>>>>> origin/main
         x = self.embedding(text)
         x = self.pos_enc(x)
         x = self.encoder(x)
 
+<<<<<<< HEAD
         spk = self.spk_proj(speaker_emb).unsqueeze(1)
         x = x + spk
 
@@ -338,6 +388,42 @@ class StudentModel(nn.Module):
 
         x = self.pos_enc(x)
         x = self.decoder(x)
+=======
+        # ----- ADD SPEAKER -----
+        spk = self.spk_proj(speaker_emb).unsqueeze(1)
+        x = x + spk
+
+        # ----- DURATION -----
+        dur_pred = self.duration_predictor(x.detach())  # Отвязываем градиенты текста от предиктора!
+
+        if mel_target is not None and target_durations is not None:
+            # ИСПОЛЬЗУЕМ РЕАЛЬНЫЕ ДЛИТЕЛЬНОСТИ
+            durations = target_durations
+
+            # Считаем лосс предиктора
+            log_dur_target = torch.log(durations.float() + 1.0)
+
+            # Считаем лосс только по реальным токенам (игнорируя паддинг)
+            mask = (text != 0).float()  # Предполагая, что 0 - это pad_token
+            dur_loss = F.mse_loss(dur_pred * mask, log_dur_target * mask)
+
+        else:
+            # ИНФЕРЕНС
+            durations = torch.clamp(
+                torch.exp(dur_pred) - 1.0,
+                min=1.0,
+                max=20.0
+            ).round().long()  # ОБЯЗАТЕЛЬНО .long()
+            dur_loss = None
+
+        # ----- LENGTH REGULATION -----
+        x = length_regulator(x, durations)
+
+        # ----- DECODER -----
+        x = self.pos_enc(x)
+        x = self.decoder(x)
+
+>>>>>>> origin/main
         mel = self.mel_proj(x)
         mel = mel + self.postnet(mel)
 
@@ -397,7 +483,11 @@ def train():
     tokenizer = VoiceBpeTokenizer(vocab_file="./xtts_vocab/vocab.json")
 
     dataset = PodcastDistillDataset(
+<<<<<<< HEAD
         root_dir="C:/Users/light/Downloads/podcasts_1_stripped_archive/podcasts_1_stripped/Test",
+=======
+        root_dir="C:/Users/light/Downloads/podcasts_1_stripped_archive/podcasts_1_stripped",
+>>>>>>> origin/main
         tokenizer=tokenizer
     )
     dataloader = DataLoader(dataset, batch_size=Config.batch_size, shuffle=True, collate_fn=collate_fn)
@@ -436,10 +526,15 @@ def train():
                 # но это требует прогона полного XTTS, что очень долго.
                 # Обучение на реальных данных (Ground Truth) с использованием Teacher Embedding -
                 # это самый эффективный способ клонирования).
+<<<<<<< HEAD
                 durs = batch["durations"].to(device)
 
                 # Передаем их Студенту как целевое значение (target)
                 mel_pred, dur_loss = student(text, speaker_emb, mel_target=mels, durations=durs)
+=======
+                durations = batch["durations"].to(device)
+                mel_pred, dur_loss = student(text, speaker_emb, mel_target=mels, target_durations=durations)
+>>>>>>> origin/main
 
                 # Приводим размерности, если не совпадают из-за паддинга
                 if mel_pred.shape[1] != mels.shape[1]:

@@ -92,10 +92,13 @@ for folder in [f for f in root_dir.iterdir() if f.is_dir()]:
         # Получаем длительности
         durations, token_ids = get_word_durations_in_frames(str(audio_path), entry["text"], mel_frames)
 
+<<<<<<< HEAD
         if durations is None or torch.isnan(durations).any() or durations.sum() == 0:
             print(f"⚠️ Пропускаем файл {audio_path.name}: обнаружены NaN или нулевая длина.")
             continue  # Не сохраняем, идем к следующему файлу
 
+=======
+>>>>>>> origin/main
         # Сохраняем
         torch.save({
             "durations": durations,
