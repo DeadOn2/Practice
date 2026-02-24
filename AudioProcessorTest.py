@@ -33,7 +33,7 @@ print(type(output_wav))
 wav_int16 = np.int16(output_wav * 32767)
 write("output2.wav", 24000, wav_int16)
 
-wav, sr = librosa.load("audio_2026-02-16_01-29-54.wav", sr = 24000)
+wav, sr = librosa.load("samples/audio_2026-02-16_01-29-54.wav", sr = 24000)
 wav = wav.astype(np.float32)
 mel = ap.melspectrogram(wav)
 print(mel.shape)

@@ -60,5 +60,5 @@ def verify_precomputed_data(root_dir, num_samples=3):
 
 if __name__ == "__main__":
     # Укажите ваш путь к папке с данными
-    DATA_PATH = "C:/Users/light/Downloads/podcasts_1_stripped_archive/podcasts_1_stripped/Test"
+    DATA_PATH = "C:/Users/light/Downloads/podcasts_1_stripped_archive/podcasts_1_stripped/test2"
     verify_precomputed_data(DATA_PATH)
