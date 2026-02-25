@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 import os
 from vocos import Vocos  # <--- ВАЖНО: Используем Vocos для инференса
 from speechbrain.inference.speaker import EncoderClassifier
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Инициализируем экстрактор голоса (скачается автоматически при первом запуске)
 # Используем ECAPA-TDNN, он выдает вектор размерностью 192
@@ -169,7 +169,7 @@ class Config:
     alpha = 0.7  # Вес MSE
     beta = 0.3  # Вес L1
 
-    lr = 1e-4
+    lr = 5e-5
     batch_size = 16
     epochs = 200
     device = torch.device("cuda")
@@ -428,7 +428,7 @@ class Decoder(nn.Module):
                 if t < teacher_mels.size(1) - 1:
                     # НОВОЕ: С вероятностью 25% заставляем модель использовать свой же выход
                     # (только если мы в режиме обучения и это не первый шаг)
-                    if self.training and t > 0 and torch.rand(1).item() < 0.25:
+                    if self.training and t > 0 and torch.rand(1).item() < 0.5:
                         mel_input = mel_out.detach()  # Отрываем от графа, чтобы не взорвать память
                     else:
                         mel_input = teacher_mels[:, t, :]
@@ -516,6 +516,14 @@ def collate_fn_podcast(batch):
     return tokens_padded, token_lens, mels_padded, mel_lens, raw_texts, audio_paths, spk_embs_tensor
 
 
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+
+
 def train_with_distillation(root_dir):
     # --- Вспомогательные функции Loss ---
     def masked_mse(preds, targets, mask):
@@ -525,7 +533,6 @@ def train_with_distillation(root_dir):
     def masked_l1(preds, targets, mask):
         diff = torch.abs(preds - targets)
         return (diff * mask).sum() / (mask.sum() * cfg.n_mels + 1e-8)
-
 
     # Конфигурация
     cfg = Config()
@@ -537,18 +544,23 @@ def train_with_distillation(root_dir):
     student = StudentTTS(cfg).to(cfg.device)
     optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr)
 
-    writer = SummaryWriter(log_dir="runs/fast_distill_v2")  # v2 чтобы не путать логи
+    # --- НОВОЕ: Инициализация ReduceLROnPlateau ---
+    # mode='min' -> мы хотим, чтобы метрика (loss) уменьшалась
+    # factor=0.5 -> уменьшаем LR в 2 раза
+    # patience=3 -> ждем 3 эпохи. Если за 3 эпохи loss не стал меньше лучшего результата, режем LR
+    # min_lr=1e-6 -> нижний порог, чтобы LR не упал до абсолютного нуля
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2, min_lr=5e-6
+    )
 
+    writer = SummaryWriter(log_dir="runs/fast_distill_v2")
 
-    # Loss для Stop Token (бинарная классификация)
-    # Увеличиваем вес до 15.0, чтобы модель ХОТЕЛА найти конец, но не сразу
     bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([15.0]).to(cfg.device), reduction='none')
-    # pos_weight=5.0 помогает, так как кадров "конца" очень мало по сравнению с "не концом"
 
     global_step = 0
     start_epoch = 0
 
-    # --- Загрузка чекпоинта (если есть) ---
+    # --- Загрузка чекпоинта ---
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -560,19 +572,17 @@ def train_with_distillation(root_dir):
         try:
             ckpt = torch.load(last_checkpoint)
 
-            # 1. Загружаем веса модели ЧАСТИЧНО (Post-Net останется рандомным)
             student.load_state_dict(ckpt['model_state_dict'], strict=False)
-
-            # 2. ВАЖНО: Комментируем загрузку оптимизатора!
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
-            # ПРИНУДИТЕЛЬНО обновляем LR для всех групп параметров
-            new_lr = 5e-5
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = new_lr
-            print(f"📉 Learning Rate принудительно установлен в: {new_lr}")
+            if 'scheduler_state_dict' in ckpt:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
 
-            # 3. Но шаг и эпоху оставляем, чтобы графики в TensorBoard не склеились
+            # --- НОВОЕ: Принудительное обновление LR УДАЛЕНО ---
+            # Теперь мы доверяем шедулеру и загруженному состоянию оптимизатора.
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"📉 Восстановлен Learning Rate: {current_lr:.6e}")
+
             global_step = ckpt.get('global_step', 0)
             start_epoch = ckpt.get('epoch', 0)
 
@@ -581,11 +591,15 @@ def train_with_distillation(root_dir):
             print(f"Ошибка загрузки: {e}")
 
     print("Начало обучения с Stop Token...")
-
     student.train()
 
     try:
         for epoch in range(start_epoch, cfg.epochs):
+
+            # --- НОВОЕ: Переменные для подсчета среднего лосса за эпоху ---
+            epoch_loss_sum = 0.0
+            num_batches = 0
+
             for batch in dataloader:
                 tokens, token_lens, gts, gt_lens, raw_texts, audio_paths, speaker_ids = batch
 
@@ -593,22 +607,16 @@ def train_with_distillation(root_dir):
                 token_lens = token_lens.to(cfg.device)
                 gts = gts.to(cfg.device)
                 gt_lens = gt_lens.to(cfg.device)
-                speaker_ids = speaker_ids.to(cfg.device)  # Отправляем на GPU
+                speaker_ids = speaker_ids.to(cfg.device)
 
-                # В этом коде мы не используем отдельный массив teachers для простоты (дистилляция из файла),
-                # но если у вас есть отдельный файл teacher_mel, загружайте его.
-                # Для примера считаем, что target - это gts (или teacher, если вы его прокинули).
                 target_mels = gts
 
                 optimizer.zero_grad()
 
-                # 1. Прямой проход (Forward)
-                # Student теперь возвращает (mel_raw, mel_post, stop, attn)
                 pred_mels_raw, pred_mels_post, pred_stops, attentions = student(
                     tokens, token_lens, speaker_embs=speaker_ids, mels=target_mels
                 )
 
-                # 2. Выравнивание длин (Trim)
                 min_len = min(pred_mels_raw.size(1), target_mels.size(1))
 
                 p_mel_raw = pred_mels_raw[:, :min_len, :]
@@ -616,50 +624,44 @@ def train_with_distillation(root_dir):
                 t_mel = target_mels[:, :min_len, :]
                 p_stop = pred_stops[:, :min_len, :]
 
-                # 3. Маска для аудио
                 mask = torch.arange(min_len, device=cfg.device).expand(len(gt_lens), min_len) < gt_lens.unsqueeze(1)
                 mask_expanded = mask.unsqueeze(-1).float()
 
-                # 4. Расчет Loss для Mel-спектрограмм (НОВОЕ: Считаем для RAW и для POST)
                 loss_mse_raw = ((p_mel_raw - t_mel) ** 2 * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
                 loss_mse_post = ((p_mel_post - t_mel) ** 2 * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
-
-                # L1 обычно считают только для финального (Post-Net) выхода
                 loss_l1 = (torch.abs(p_mel_post - t_mel) * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
 
-                # 5. Расчет Loss для Stop Token (Оставляем как было)
                 stop_targets = torch.zeros_like(p_stop)
                 for i, length in enumerate(gt_lens):
                     if length < min_len:
                         stop_targets[i, length:, 0] = 1.0
 
                 loss_stop = bce_loss(p_stop, stop_targets).mean()
-
-                # Рассчитываем Guided Loss
                 loss_guide = guided_attention_loss(attentions, token_lens, gt_lens)
 
-                # 6. Суммарный Loss (НОВОЕ: добавляем loss_mse_post)
-                # Мы штрафуем модель и за сырой выход, и за выход после фильтра
                 loss = (cfg.alpha * loss_mse_raw) + (cfg.alpha * loss_mse_post) + (cfg.beta * loss_l1) + loss_stop + (
                             10.0 * loss_guide)
+
                 loss.backward()
-
-                # Gradient Clipping (важно для LSTM)
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-
                 optimizer.step()
 
+                # --- НОВОЕ: Накапливаем лосс ---
+                epoch_loss_sum += loss.item()
+                num_batches += 1
                 global_step += 1
 
-                # Логирование
                 if global_step % 10 == 0:
                     writer.add_scalar('Loss/Total', loss.item(), global_step)
                     writer.add_scalar('Loss/Guide', loss_guide.item(), global_step)
-
                     writer.add_scalar('Loss/Mel_MSE', loss_mse_post.item(), global_step)
                     writer.add_scalar('Loss/L1', loss_l1.item(), global_step)
                     writer.add_scalar('Loss/Stop_BCE', loss_stop.item(), global_step)
-                    attn_matrix = attentions[0].detach().cpu().numpy()  # Формат: (T_dec, T_enc)
+
+                    current_lr = optimizer.param_groups[0]['lr']
+                    writer.add_scalar('Training/Learning_Rate', current_lr, global_step)
+
+                    attn_matrix = attentions[0].detach().cpu().numpy()
 
                     fig, ax = plt.subplots(figsize=(6, 4))
                     im = ax.imshow(attn_matrix, aspect='auto', origin='lower', interpolation='none')
@@ -669,23 +671,41 @@ def train_with_distillation(root_dir):
                     plt.ylabel("Decoder Steps (Audio)")
                     plt.tight_layout()
 
-                    # Отправляем в TensorBoard и закрываем график
                     writer.add_figure('Attention_Alignment', fig, global_step)
 
                     print(
-                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | Mel: {loss_mse_post.item():.6f} | L1: {loss_l1.item():.6f}| Stop: {loss_stop.item():.6f} | Guide: {loss_guide.item():.6f}")
+                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | Mel: {loss_mse_post.item():.6f} | L1: {loss_l1.item():.6f}| Stop: {loss_stop.item():.6f} | Guide: {loss_guide.item():.6f} | LR: {current_lr:.6e}")
 
-                # Сохранение чекпоинта
-                if global_step % 250 == 0:
-                    save_path = os.path.join(checkpoint_dir, f"student_step_{global_step}.pth")
-                    torch.save({
-                        'global_step': global_step,
-                        'epoch': epoch,
-                        'model_state_dict': student.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': loss.item(),
-                    }, save_path)
-                    print(f"💾 Чекпоинт сохранен: {save_path}")
+                    # Сохранение чекпоинта
+                    if global_step % 250 == 0:
+                        save_path = os.path.join(checkpoint_dir, f"student_step_{global_step}.pth")
+
+                        # Получаем текущий LR для вывода и сохранения
+                        current_lr = optimizer.param_groups[0]['lr']
+
+                        torch.save({
+                            'global_step': global_step,
+                            'epoch': epoch,
+                            'model_state_dict': student.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'loss': loss.item(),
+                            'lr': current_lr  # Сохраним и в словаре для истории
+                        }, save_path)
+
+                        print(
+                            f"💾 Шаг {global_step}: Чекпоинт сохранен. Текущий LR: {current_lr:.6e} | Путь: {save_path}")
+
+            # --- НОВОЕ: Шаг шедулера в конце эпохи ---
+            # Вычисляем средний лосс за всю эпоху
+            avg_epoch_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
+
+            # Передаем средний лосс в шедулер. Он сравнит его с лучшим (минимальным)
+            # сохраненным лоссом и решит, резать LR или нет.
+            scheduler.step(avg_epoch_loss)
+
+            print(
+                f"🔻 Эпоха {epoch} завершена. Средний лосс: {avg_epoch_loss:.6f}. Текущий LR: {optimizer.param_groups[0]['lr']:.6e}")
 
     except KeyboardInterrupt:
         print("\nОстановка обучения пользователем...")
@@ -695,38 +715,42 @@ def train_with_distillation(root_dir):
             'epoch': epoch,
             'model_state_dict': student.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
             'loss': loss.item(),
         }, save_path)
         print("💾 Аварийный чекпоинт сохранен.")
 
     writer.close()
-    plt.close(fig)
+    try:
+        plt.close(fig)
+    except NameError:
+        pass
     print("Обучение завершено.")
 
 
 # ==========================================
 # 10. Inference & Main
 # ==========================================
-def inference(model, text, ref_audio_path, cfg, processor):
-    model.eval()
-    tokens = torch.tensor([processor.encode(text)], dtype=torch.long).to(cfg.device)
-    lens = torch.tensor([tokens.size(1)]).to(cfg.device)
-
-    signal, fs = torchaudio.load(ref_audio_path)
-    if fs != 16000:
-        resampler = torchaudio.transforms.Resample(orig_freq=fs, new_freq=16000)
-        signal = resampler(signal)
-
-    with torch.no_grad():
-        signal = signal.to(cfg.device)
-        spk_emb = spk_classifier.encode_batch(signal).squeeze(0).squeeze(0)
-
-    # 2. Инференс модели (НОВОЕ: забираем второй аргумент)
-    with torch.no_grad():
-        mel_raw, mel_post, _, _ = model(tokens, lens, speaker_embs=spk_emb.unsqueeze(0))
-
-    # Возвращаем именно mel_post!
-    return mel_post
+# def inference(model, text, ref_audio_path, cfg, processor):
+#     model.eval()
+#     tokens = torch.tensor([processor.encode(text)], dtype=torch.long).to(cfg.device)
+#     lens = torch.tensor([tokens.size(1)]).to(cfg.device)
+#
+#     signal, fs = torchaudio.load(ref_audio_path)
+#     if fs != 16000:
+#         resampler = torchaudio.transforms.Resample(orig_freq=fs, new_freq=16000)
+#         signal = resampler(signal)
+#
+#     with torch.no_grad():
+#         signal = signal.to(cfg.device)
+#         spk_emb = spk_classifier.encode_batch(signal).squeeze(0).squeeze(0)
+#
+#     # 2. Инференс модели (НОВОЕ: забираем второй аргумент)
+#     with torch.no_grad():
+#         mel_raw, mel_post, _, _ = model(tokens, lens, speaker_embs=spk_emb.unsqueeze(0))
+#
+#     # Возвращаем именно mel_post!
+#     return mel_post
 
 import torchaudio
 
