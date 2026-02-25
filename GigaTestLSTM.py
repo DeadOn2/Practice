@@ -113,6 +113,19 @@ class PodcastDistillDataset(Dataset):
 
 import matplotlib.pyplot as plt
 
+class AudioNormalizer:
+    def __init__(self):
+        # Константы для Vocos (приблизительные, можно уточнить на своем датасете)
+        self.mean = -4.0
+        self.std = 4.0
+
+    def normalize(self, mel):
+        return (mel - self.mean) / self.std
+
+    def denormalize(self, mel):
+        return (mel * self.std) + self.mean
+
+normalizer = AudioNormalizer()
 
 def save_mel_image(mel, path="mel_spectrogram.png"):
     # Если это тензор PyTorch, переносим на CPU и превращаем в numpy
@@ -156,10 +169,10 @@ class Config:
     alpha = 0.7  # Вес MSE
     beta = 0.3  # Вес L1
 
-    lr = 4e-4
+    lr = 1e-4
     batch_size = 16
     epochs = 200
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
 
 
 # ==========================================
@@ -552,6 +565,12 @@ def train_with_distillation(root_dir):
 
             # 2. ВАЖНО: Комментируем загрузку оптимизатора!
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+
+            # ПРИНУДИТЕЛЬНО обновляем LR для всех групп параметров
+            new_lr = 5e-5
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = new_lr
+            print(f"📉 Learning Rate принудительно установлен в: {new_lr}")
 
             # 3. Но шаг и эпоху оставляем, чтобы графики в TensorBoard не склеились
             global_step = ckpt.get('global_step', 0)

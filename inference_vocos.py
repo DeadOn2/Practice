@@ -9,9 +9,10 @@ from speechbrain.inference.speaker import EncoderClassifier
 
 # Импортируем твои классы из файла обучения
 # Убедись, что файл называется GigaTestLSTM.py или измени импорт
-from GigaTestLSTM import Config, TextProcessor, StudentTTS
+from GigaTestLSTM import Config, TextProcessor, StudentTTS, AudioNormalizer
 
-
+# Создаем экземпляр (параметры mean/std должны быть ТАКИМИ ЖЕ, как при обучении)
+normalizer = AudioNormalizer()
 # ==========================================
 # 1. Загрузка вспомогательных моделей
 # ==========================================
@@ -103,11 +104,15 @@ def generate_zero_shot(
     save_attention_image(attentions[0], "inference_attention.png")
 
     # 4. Логика Stop Token
-    stop_probs = torch.sigmoid(stop_output[0]).cpu().numpy()
-    stop_threshold = 0.5
-    min_frames = 50
+    # 4. Логика Stop Token
+    stop_probs = torch.sigmoid(stop_output[0]).cpu().numpy()  # [Time, 1]
 
-    # Ищем индекс остановки
+    # ДОБАВЬ ЭТО: Посмотрим, насколько модель вообще уверена
+    print(f"📊 Максимальная вероятность стоп-токена за весь файл: {stop_probs.max():.4f}")
+
+    stop_threshold = 0.01  # <--- СНИЗИЛИ ПОРОГ (было 0.5)
+    min_frames = 50  # Не останавливаться раньше ~0.5 сек
+
     stop_indices = np.where(stop_probs[min_frames:] > stop_threshold)[0]
 
     # Работаем теперь с mel_post
@@ -149,7 +154,7 @@ if __name__ == "__main__":
 
     # Укажи путь к НОВОМУ чекпоинту (обученному на Vocos данных)
     # Старые чекпоинты (обученные на librosa) работать НЕ БУДУТ
-    ckpt_path = "checkpoints/student_step_13500.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
+    ckpt_path = "checkpoints/student_step_23750.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
 
     if os.path.exists(ckpt_path):
         print(f"📂 Загрузка весов из {ckpt_path}")
@@ -162,7 +167,7 @@ if __name__ == "__main__":
     vocoder, spk_encoder = load_models(cfg, device=device)
 
     # 3. Данные для теста
-    test_text = "Я говорю обычную речь."
+    test_text = "Привет проверка текста."
 
     # Путь к файлу с голосом (любой wav/mp3)
     # ref_audio = r"C:\Users\light\Downloads\podcasts_1_stripped_archive\podcasts_1_stripped\test\100605980\100605980_1.mp3"
