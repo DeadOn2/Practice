@@ -1,92 +1,218 @@
-import torch
+import os
 import numpy as np
-import librosa
-import soundfile as sf
-from pathlib import Path
-from GigaTestLSTM import Config, TextProcessor, StudentTTS
-
-# Предполагаем, что твои классы Config, TextProcessor и StudentTTS в этом же файле
-# Если в другом — импортируй их: from my_model_file import Config, StudentTTS, TextProcessor
-
 import torch
-import numpy as np
-import librosa
+import torchaudio
 import soundfile as sf
-from pathlib import Path
+import matplotlib.pyplot as plt
+
+from vocos import Vocos
+from speechbrain.inference.speaker import EncoderClassifier
+
+# Импортируем твои классы из файла обучения
+# Убедись, что файл называется GigaTestLSTM.py или измени импорт
+from GigaTestLSTM_stable import Config, TextProcessor, StudentTTS
 
 
-def manual_griffin_lim(S, n_iter=64, hop_length=256, win_length=1024):
-    """Ручная реализация Griffin-Lim без использования проблемных функций librosa"""
-    # Создаем случайную фазу вручную через экспоненту (обходим librosa.util.phasor)
-    angles = np.exp(2j * np.pi * np.random.rand(*S.shape).astype(np.float32))
-    S_complex = S.astype(np.complex64)
+# ==========================================
+# 1. Загрузка вспомогательных моделей
+# ==========================================
+def load_models(cfg, device="cpu"):
+    print(f"⏳ Загрузка Vocos на {device}...")
 
-    # Первое обратное преобразование
-    y = librosa.istft(S_complex * angles, hop_length=hop_length, win_length=win_length)
+    # Загружаем ту же модель, что использовали для подготовки данных
+    vocoder = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
+    vocoder.eval()
 
-    for i in range(n_iter):
-        # Прямое STFT
-        stft = librosa.stft(y, n_fft=win_length, hop_length=hop_length, win_length=win_length)
-        # Извлекаем фазу
-        angles = np.exp(1j * np.angle(stft))
-        # Обратное STFT с оригинальной амплитудой S
-        y = librosa.istft(S * angles, hop_length=hop_length, win_length=win_length)
-    return y
+    print(f"⏳ Загрузка Speaker Encoder (ECAPA-TDNN) на {device}...")
+    spk_encoder = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        run_opts={"device": device},
+    )
+
+    return vocoder, spk_encoder
 
 
-def inference_griffin_lim(text, checkpoint_path, output_filename="output_lim_1000.wav"):
-    cfg = Config()
-    cfg.device = torch.device("cpu")
-    tp = TextProcessor(cfg.RUS_ALPHABET)
+# ==========================================
+# 2. Извлечение эмбеддинга (SpeechBrain)
+# ==========================================
+def extract_speaker_embedding(audio_path, encoder, device):
+    # SpeechBrain ECAPA-TDNN требует 16000 Hz
+    signal, fs = torchaudio.load(audio_path)
 
-    print(f"Загрузка модели: {checkpoint_path}...")
-    model = StudentTTS(cfg).to(cfg.device)
-    checkpoint = torch.load(checkpoint_path, map_location=cfg.device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
+    if fs != 16000:
+        resampler = torchaudio.transforms.Resample(
+            orig_freq=fs,
+            new_freq=16000,
+        )
+        signal = resampler(signal)
 
-    tokens = torch.tensor([tp.encode(text)], dtype=torch.long).to(cfg.device)
-    lens = torch.tensor([tokens.size(1)]).to(cfg.device)
+    # Если стерео -> моно
+    if signal.shape[0] > 1:
+        signal = torch.mean(signal, dim=0, keepdim=True)
 
-    print("Генерация спектрограммы...")
+    # Нормализация громкости перед энкодером (опционально, но полезно)
+    signal = signal / torch.max(torch.abs(signal))
+
     with torch.no_grad():
-        mel_output = model(tokens, lens, mels=None)
+        # signal должен быть на том же устройстве, что и энкодер
+        emb = encoder.encode_batch(signal.to(device))
 
-    mel = mel_output.squeeze(0).cpu().numpy().T.astype(np.float32)
+    return emb.squeeze(1)  # [1, 192]
 
-    # Денормализация (модель училась в [0, 1])
-    mel = np.clip(mel, 0, 1)
-    mel = (mel * 80.0) - 80.0
-    mel_power = librosa.db_to_power(mel)
 
-    # Вместо mel_to_audio делаем цепочку вручную
-    print("Восстановление звука (Manual Griffin-Lim)...")
-
-    # 1. Сначала восстанавливаем линейную спектрограмму из Мел-шкалы
-    # Это нужно, так как Griffin-Lim работает с STFT
-    stft_mag = librosa.feature.inverse.mel_to_stft(
-        mel_power,
-        sr=cfg.sample_rate,
-        n_fft=1024,
-        power=1.0
+# ==========================================
+# 3. Визуализация Attention
+# ==========================================
+def save_attention_image(attn, path="debug_attention.png"):
+    plt.figure(figsize=(10, 6))
+    plt.imshow(
+        attn.cpu().numpy(),
+        aspect="auto",
+        origin="lower",
+        interpolation="none",
     )
+    plt.xlabel("Encoder steps (Text)")
+    plt.ylabel("Decoder steps (Audio)")
+    plt.title("Attention Map")
+    plt.colorbar()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
 
-    # 2. Запускаем наш ручной алгоритм
-    audio = manual_griffin_lim(
-        stft_mag,
-        n_iter=64,
-        hop_length=cfg.hop_length,
-        win_length=1024
-    )
+    print(f"🔍 Карта внимания сохранена в {path}")
 
-    # Сохранение
-    audio = audio / (np.max(np.abs(audio)) + 1e-8)
-    sf.write(output_filename, audio, cfg.sample_rate)
-    print(f"✅ Готово! Файл: {output_filename}")
+
+# ==========================================
+# 4. Основная функция генерации
+# ==========================================
+def generate_zero_shot(
+    student_model,
+    vocoder,
+    spk_encoder,
+    text,
+    ref_audio_path,
+    cfg,
+    processor,
+    output_path="zero_shot_result.wav",
+    device="cpu",
+):
+    student_model.eval()
+    student_model.to(device)
+
+    # 1. Подготовка текста
+    tokens = torch.tensor(
+        [processor.encode(text)],
+        dtype=torch.long,
+    ).to(device)
+
+    lens = torch.tensor([tokens.size(1)]).to(device)
+    print(tokens)
+
+    # 2. Подготовка голоса
+    print(f"🎤 Читаем голос из: {ref_audio_path}")
+    spk_emb = extract_speaker_embedding(ref_audio_path, spk_encoder, device)
+
+    print("🤖 Генерация спектрограммы...")
+    with torch.no_grad():
+        # mel_output: [1, Time, 100]
+        # stop_output: [1, Time, 1]
+        mel_output, stop_output, attentions = student_model(
+            tokens,
+            lens,
+            speaker_embs=spk_emb,
+        )
+
+    # 3. Визуализация Attention
+    save_attention_image(attentions[0], "inference_attention.png")
+
+    # 4. Логика Stop Token
+    stop_probs = torch.sigmoid(stop_output[0]).cpu().numpy()  # [Time, 1]
+
+    stop_threshold = 0.5
+    min_frames = 50  # Не останавливаться раньше ~0.5 сек
+
+    # Ищем, где вероятность остановки превысила порог
+    stop_indices = np.where(stop_probs[min_frames:] > stop_threshold)[0]
+
+    if len(stop_indices) > 0:
+        cut_idx = stop_indices[0] + min_frames
+        print(f"✂️ Обрезка по Stop Token на кадре {cut_idx}")
+        mel_output = mel_output[:, :cut_idx, :]
+    else:
+        print("⚠️ Stop Token не сработал, генерируем полную длину.")
+
+    # 5. Синтез звука через Vocos
+    print("🔊 Синтез аудио (Vocos)...")
+
+    # Модель выдала [1, Time, 100]
+    # Vocos ожидает [1, 100, Time]
+    features = mel_output.transpose(1, 2)
+
+    # ВНИМАНИЕ:
+    # Мы НЕ делаем денормализацию ((x*80)-80),
+    # так как модель училась предсказывать чистые признаки Vocos.
+    with torch.no_grad():
+        wav = vocoder.decode(features)
+        wav = wav.squeeze().cpu().numpy()
+
+    # Сохраняем (Vocos 24khz)
+    sf.write(output_path, wav, 24000)
+    print(f"✅ Готово! Аудио сохранено в: {output_path}")
+
 
 if __name__ == "__main__":
-    # Укажи путь к своему чекпоинту
-    CHECKPOINT = "checkpoints/student_step_1000.pth"
-    TEST_TEXT = "Привет! Я использую алгоритм Гриффин Лим для синтеза речи."
+    # Выбираем устройство
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Используем устройство: {device}")
 
-    inference_griffin_lim(TEST_TEXT, CHECKPOINT)
+    cfg = Config()
+    cfg.speaker_embedding_dim = 192  # Должно совпадать с SpeechBrain
+
+    tp = TextProcessor(cfg.RUS_ALPHABET)
+
+    # 1. Загрузка Студента
+    student = StudentTTS(cfg).to(device)
+
+    # Укажи путь к НОВОМУ чекпоинту (обученному на Vocos данных)
+    # Старые чекпоинты (обученные на librosa) работать НЕ БУДУТ
+    ckpt_path = "checkpoints/student_step_11000.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
+
+    if os.path.exists(ckpt_path):
+        print(f"📂 Загрузка весов из {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        student.load_state_dict(ckpt["model_state_dict"])
+    else:
+        print(f"⚠️ Чекпоинт {ckpt_path} не найден! Будет шум.")
+
+    # 2. Загрузка Вокодера и Энкодера
+    vocoder, spk_encoder = load_models(cfg, device=device)
+
+    # 3. Данные для теста
+    test_text = "Знаменитость Биг Боб"
+
+    # Путь к файлу с голосом (любой wav/mp3)
+    ref_audio = (
+        "samples/audio_2026-02-16_01-29-54.wav"
+    )
+    # r"C:\Users\light\Downloads\podcasts_1_stripped_archive\podcasts_1_stripped\test\100605980\100605980_1.mp3
+    # Если файла нет — создадим шум для теста (чтобы код не упал)
+    if not os.path.exists(ref_audio):
+        print("Создаю временный файл голоса для теста...")
+        sf.write(
+            ref_audio,
+            np.random.uniform(-0.5, 0.5, 16000 * 3),
+            16000,
+        )
+
+    # 4. Запуск
+    generate_zero_shot(
+        student,
+        vocoder,
+        spk_encoder,
+        test_text,
+        ref_audio,
+        cfg,
+        tp,
+        output_path="result_vocos3.wav",
+        device=device,
+    )

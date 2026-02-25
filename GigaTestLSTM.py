@@ -2,9 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
-import numpy as np
-import librosa
 import json
 from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
@@ -159,9 +156,9 @@ class Config:
     alpha = 0.7  # Вес MSE
     beta = 0.3  # Вес L1
 
-    lr = 2e-4
+    lr = 4e-4
     batch_size = 16
-    epochs = 100
+    epochs = 200
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -180,32 +177,6 @@ class TextProcessor:
 
     def decode(self, ids):
         return "".join([self.id_to_char[i] for i in ids if i in self.id_to_char])
-
-
-# ==========================================
-# 3. Attention Module (Bahdanau)
-# ==========================================
-# class BahdanauAttention(nn.Module):
-#     def __init__(self, encoder_dim, decoder_dim, attention_dim):
-#         super().__init__()
-#         self.W1 = nn.Linear(encoder_dim, attention_dim, bias=False)
-#         self.W2 = nn.Linear(decoder_dim, attention_dim, bias=False)
-#         self.V = nn.Linear(attention_dim, 1, bias=False)
-#
-#     def forward(self, query, keys, mask=None):
-#         # query: (B, 1, dec_dim), keys: (B, T, enc_dim)
-#         proj_key = self.W1(keys)
-#         proj_query = self.W2(query)
-#
-#         scores = self.V(torch.tanh(proj_key + proj_query)).squeeze(-1)
-#
-#         if mask is not None:
-#             scores = scores.masked_fill(mask == 0, -1e9)
-#
-#         weights = F.softmax(scores, dim=-1)
-#         context = torch.bmm(weights.unsqueeze(1), keys)
-#         return context, weights
-
 class LocationSensitiveAttention(nn.Module):
     def __init__(self, encoder_dim, decoder_dim, attention_dim, attention_location_n_filters=32,
                  attention_location_kernel_size=31):
@@ -314,11 +285,60 @@ class PreNet(nn.Module):
         self.layer2 = nn.Linear(sizes[0], sizes[1])
 
     def forward(self, x):
-        # Dropout нужен ОБЯЗАТЕЛЬНО, именно он заставляет работать attention
-        x = F.dropout(F.relu(self.layer1(x)), p=0.5, training=self.training)
-        x = F.dropout(F.relu(self.layer2(x)), p=0.5, training=self.training)
+        # ВАЖНО: training=True стоит ЖЕСТКО. Dropout должен работать всегда!
+        x = F.dropout(F.relu(self.layer1(x)), p=0.5, training=True)
+        x = F.dropout(F.relu(self.layer2(x)), p=0.5, training=True)
         return x
 
+
+class PostNet(nn.Module):
+    def __init__(self, n_mels=100, postnet_embedding_dim=512, kernel_size=5, dropout=0.1):
+        super().__init__()
+
+        self.convolutions = nn.ModuleList()
+
+        # Первый слой (in: n_mels, out: 512)
+        self.convolutions.append(
+            nn.Sequential(
+                nn.Conv1d(n_mels, postnet_embedding_dim, kernel_size, stride=1, padding=int((kernel_size - 1) / 2)),
+                nn.BatchNorm1d(postnet_embedding_dim)
+            )
+        )
+
+        # Средние 3 слоя (in: 512, out: 512)
+        for _ in range(3):
+            self.convolutions.append(
+                nn.Sequential(
+                    nn.Conv1d(postnet_embedding_dim, postnet_embedding_dim, kernel_size, stride=1,
+                              padding=int((kernel_size - 1) / 2)),
+                    nn.BatchNorm1d(postnet_embedding_dim)
+                )
+            )
+
+        # Последний слой (in: 512, out: n_mels) - БЕЗ активации в конце
+        self.convolutions.append(
+            nn.Sequential(
+                nn.Conv1d(postnet_embedding_dim, n_mels, kernel_size, stride=1, padding=int((kernel_size - 1) / 2)),
+                nn.BatchNorm1d(n_mels)
+            )
+        )
+
+        self.dropout = dropout
+
+    def forward(self, x):
+        # x приходит из декодера с размерностью [Batch, Time, Mels]
+        # Свертки Conv1d ожидают размерность [Batch, Mels, Time]
+        x = x.transpose(1, 2)
+
+        for i in range(len(self.convolutions) - 1):
+            x = F.dropout(torch.tanh(self.convolutions[i](x)), p=self.dropout, training=self.training)
+
+        # Последний слой без Tanh
+        x = F.dropout(self.convolutions[-1](x), p=self.dropout, training=self.training)
+
+        # Возвращаем к размерности [Batch, Time, Mels]
+        x = x.transpose(1, 2)
+        return x
 
 class Decoder(nn.Module):
     def __init__(self, n_mels, decoder_hidden, encoder_total_dim, attention_dim, speaker_dim):
@@ -379,20 +399,29 @@ class Decoder(nn.Module):
             stop_tokens.append(stop_out)
 
             # Teacher forcing
+            # Teacher forcing c вероятностью (Scheduled Sampling)
+            if teacher_mels is None:
+                # Берем вероятность стоп-токена через сигмоиду
+                stop_prob = torch.sigmoid(stop_out)[0].item()
+
+                # Условия остановки:
+                # - Прошло хотя бы 20-30 кадров (чтобы не упасть в самом начале)
+                # - Вероятность конца > 0.5
+                if t > 30 and stop_prob > 0.5:
+                    print(f"DEBUG: Модель решила остановиться на шаге {t}")
+                    break
+
             if teacher_mels is not None:
                 if t < teacher_mels.size(1) - 1:
-                    mel_input = teacher_mels[:, t, :]
+                    # НОВОЕ: С вероятностью 25% заставляем модель использовать свой же выход
+                    # (только если мы в режиме обучения и это не первый шаг)
+                    if self.training and t > 0 and torch.rand(1).item() < 0.25:
+                        mel_input = mel_out.detach()  # Отрываем от графа, чтобы не взорвать память
+                    else:
+                        mel_input = teacher_mels[:, t, :]
                 else:
                     mel_input = mel_out
             else:
-                # Заставляем модель пройти минимум 50 шагов (около 0.6 сек)
-                # И используем сглаженное среднее по батчу, чтобы не вылетать от одного шума
-                # stop_prob = torch.sigmoid(stop_out).mean().item()
-                # if t > 50 and stop_prob > 0.5:
-                #     break
-                # mel_input = mel_out
-                # if torch.sigmoid(stop_out).item() > 0.5:
-                #     break
                 mel_input = mel_out
 
         return torch.stack(outputs, dim=1), torch.stack(stop_tokens, dim=1), torch.stack(attentions, dim=1)
@@ -412,6 +441,7 @@ class StudentTTS(nn.Module):
             # УДАЛИЛИ: num_speakers
             speaker_dim=cfg.speaker_embedding_dim
         )
+        self.postnet = PostNet(n_mels=cfg.n_mels)
 
     def forward(self, text, text_lengths, speaker_embs, mels=None):
         device = text.device
@@ -420,59 +450,12 @@ class StudentTTS(nn.Module):
 
         encoder_outputs = self.encoder(text, text_lengths)
         mel_outputs, stop_outputs, attentions = self.decoder(encoder_outputs, mask, speaker_embs, teacher_mels=mels)
-        return mel_outputs, stop_outputs, attentions
 
+        # --- НОВОЕ: Пропускаем через Post-Net и прибавляем к сырому выходу ---
+        mel_outputs_post = mel_outputs + self.postnet(mel_outputs)
 
-# ==========================================
-# 7. Teacher (Coqui TTS - Russian Model)
-# ==========================================
-# def get_teacher_mel(text_list):
-#     from TTS.api import TTS
-#     import os
-#
-#     print("Загрузка XTTS v2 (может занять время при первом запуске)...")
-#     # XTTS v2 требует подтверждения лицензии (agree_tosc=True)
-#     try:
-#         teacher_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(Config.device)
-#     except Exception as e:
-#         print(f"Ошибка при загрузке XTTS: {e}")
-#         return None
-#
-#     # XTTS нужен образец голоса (клонирование).
-#     # Если у вас есть свой .wav, укажите путь к нему.
-#     # Если нет — мы скачаем/создадим пустышку для инициализации.
-#     speaker_wav = "reference_voice.wav"
-#     if not os.path.exists(speaker_wav):
-#         print("Создаем пустой образец для инициализации (лучше подложить свой 5-10 сек wav)...")
-#         # В идеале здесь должен быть реальный файл. Для теста XTTS может капризничать без него.
-#         # Если у вас есть любой файл .wav на диске, лучше укажите путь к нему.
-#         import soundfile as sf
-#         sf.write(speaker_wav, np.random.uniform(-1, 1, 22050 * 3), 22050)
-#
-#     teacher_mels = []
-#     with torch.no_grad():
-#         for text in text_list:
-#             print(f"Генерация 'учителя' для фразы: {text[:30]}...")
-#             # XTTS v2 требует указания языка
-#             wav = teacher_model.tts(
-#                 text=text,
-#                 speaker_wav=speaker_wav,
-#                 language="ru"
-#             )
-#             wav = np.array(wav)
-#
-#             # Mel-spectrogram
-#             mel = librosa.feature.melspectrogram(
-#                 y=wav, sr=Config.sample_rate, n_fft=1024,
-#                 hop_length=Config.hop_length, n_mels=Config.n_mels
-#             )
-#             mel = librosa.power_to_db(mel, ref=np.max)
-#             mel = (mel + 80) / 80
-#             teacher_mels.append(torch.FloatTensor(mel).T)
-#
-#     return teacher_mels
-
-
+        # Возвращаем 4 значения (сырой мел и улучшенный мел)
+        return mel_outputs, mel_outputs_post, stop_outputs, attentions
 # ==========================================
 # 8. Dataset & Collate
 # ==========================================
@@ -500,32 +483,6 @@ def save_checkpoint(model, optimizer, epoch, global_step, loss, path):
     }
     torch.save(checkpoint, path)
     print(f"--- Чекпоинт сохранен: {path} ---")
-# ==========================================
-# 9. Training Loop
-# ==========================================
-# def get_teacher_prediction(teacher_model, text, ref_audio_path, cfg):
-#     """
-#     Генерирует 'идеальный' мел от XTTS, используя оригинальное аудио как референс.
-#     """
-#     with torch.no_grad():
-#         # Генерируем аудио учителем
-#         wav = teacher_model.tts(
-#             text=text,
-#             speaker_wav=ref_audio_path,
-#             language="ru"
-#         )
-#         wav = np.array(wav)
-#
-#         # Конвертируем в мел
-#         mel = librosa.feature.melspectrogram(
-#             y=wav, sr=cfg.sample_rate, n_fft=1024,
-#             hop_length=cfg.hop_length, n_mels=cfg.n_mels
-#         )
-#         mel = librosa.power_to_db(mel, ref=np.max)
-#         mel = (mel + 80) / 80
-#         return torch.FloatTensor(mel).T
-
-
 # ==========================================
 # 3. Обновленный Collate и Training Loop
 # ==========================================
@@ -589,13 +546,20 @@ def train_with_distillation(root_dir):
         print(f"Загрузка чекпоинта: {last_checkpoint}")
         try:
             ckpt = torch.load(last_checkpoint)
-            student.load_state_dict(ckpt['model_state_dict'])
+
+            # 1. Загружаем веса модели ЧАСТИЧНО (Post-Net останется рандомным)
+            student.load_state_dict(ckpt['model_state_dict'], strict=False)
+
+            # 2. ВАЖНО: Комментируем загрузку оптимизатора!
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+
+            # 3. Но шаг и эпоху оставляем, чтобы графики в TensorBoard не склеились
             global_step = ckpt.get('global_step', 0)
             start_epoch = ckpt.get('epoch', 0)
-            print(f"Восстановлено: Эпоха {start_epoch}, Шаг {global_step}")
+
+            print(f"✅ Успех! Модель подхватила старые веса. Начинаем с шага {global_step}")
         except Exception as e:
-            print(f"Ошибка загрузки чекпоинта, начинаем с нуля: {e}")
+            print(f"Ошибка загрузки: {e}")
 
     print("Начало обучения с Stop Token...")
 
@@ -620,48 +584,45 @@ def train_with_distillation(root_dir):
                 optimizer.zero_grad()
 
                 # 1. Прямой проход (Forward)
-                # Student теперь возвращает (mel, stop)
-                pred_mels, pred_stops, attentions = student(tokens, token_lens, speaker_embs=speaker_ids,
-                                                            mels=target_mels) # переменная называется speaker_ids, но теперь содержит векторы                # 2. Выравнивание длин (Trim)
-                # Нам нужно обрезать всё до минимальной длины в батче, чтобы считать лосс
-                min_len = min(pred_mels.size(1), target_mels.size(1))
+                # Student теперь возвращает (mel_raw, mel_post, stop, attn)
+                pred_mels_raw, pred_mels_post, pred_stops, attentions = student(
+                    tokens, token_lens, speaker_embs=speaker_ids, mels=target_mels
+                )
 
-                p_mel = pred_mels[:, :min_len, :]
+                # 2. Выравнивание длин (Trim)
+                min_len = min(pred_mels_raw.size(1), target_mels.size(1))
+
+                p_mel_raw = pred_mels_raw[:, :min_len, :]
+                p_mel_post = pred_mels_post[:, :min_len, :]
                 t_mel = target_mels[:, :min_len, :]
-                p_stop = pred_stops[:, :min_len, :]  # (B, T, 1)
+                p_stop = pred_stops[:, :min_len, :]
 
-                # 3. Маска для аудио (где реальный звук, а где паддинг)
-                # Создаем маску [B, min_len]
+                # 3. Маска для аудио
                 mask = torch.arange(min_len, device=cfg.device).expand(len(gt_lens), min_len) < gt_lens.unsqueeze(1)
-                mask_expanded = mask.unsqueeze(-1).float()  # (B, T, 1)
+                mask_expanded = mask.unsqueeze(-1).float()
 
-                # 4. Расчет Loss для Mel-спектрограммы
-                loss_mse = ((p_mel - t_mel) ** 2 * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
-                loss_l1 = (torch.abs(p_mel - t_mel) * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
+                # 4. Расчет Loss для Mel-спектрограмм (НОВОЕ: Считаем для RAW и для POST)
+                loss_mse_raw = ((p_mel_raw - t_mel) ** 2 * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
+                loss_mse_post = ((p_mel_post - t_mel) ** 2 * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
 
-                # 5. Расчет Loss для Stop Token
-                # Создаем таргеты для Stop Token: 0 везде, 1 в конце (в паддинге)
-                # 5. Расчет Loss для Stop Token
+                # L1 обычно считают только для финального (Post-Net) выхода
+                loss_l1 = (torch.abs(p_mel_post - t_mel) * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
+
+                # 5. Расчет Loss для Stop Token (Оставляем как было)
                 stop_targets = torch.zeros_like(p_stop)
-
                 for i, length in enumerate(gt_lens):
-                    # Ставим 1.0 начиная с реального конца аудио
                     if length < min_len:
                         stop_targets[i, length:, 0] = 1.0
 
-                # ВАЖНО: Не применяем mask_expanded к Stop Loss!
-                # Модель должна учиться предсказывать 1 в зоне паддинга.
-                # Мы используем reduce='mean' (по умолчанию в BCE, но у тебя 'none', поэтому делаем mean вручную)
-
                 loss_stop = bce_loss(p_stop, stop_targets).mean()
-                # 6. Суммарный Loss
-                # Вес для stop loss можно варьировать, обычно 1.0 работает нормально
+
                 # Рассчитываем Guided Loss
                 loss_guide = guided_attention_loss(attentions, token_lens, gt_lens)
 
-                # Складываем всё вместе. Даем штрафу БОЛЬШОЙ вес (например, 10.0), чтобы сломать текущую привычку модели.
-                # Было 10 у loos_guide
-                loss = (cfg.alpha * loss_mse) + (cfg.beta * loss_l1) + loss_stop + (50 * loss_guide)
+                # 6. Суммарный Loss (НОВОЕ: добавляем loss_mse_post)
+                # Мы штрафуем модель и за сырой выход, и за выход после фильтра
+                loss = (cfg.alpha * loss_mse_raw) + (cfg.alpha * loss_mse_post) + (cfg.beta * loss_l1) + loss_stop + (
+                            10.0 * loss_guide)
                 loss.backward()
 
                 # Gradient Clipping (важно для LSTM)
@@ -676,7 +637,7 @@ def train_with_distillation(root_dir):
                     writer.add_scalar('Loss/Total', loss.item(), global_step)
                     writer.add_scalar('Loss/Guide', loss_guide.item(), global_step)
 
-                    writer.add_scalar('Loss/Mel_MSE', loss_mse.item(), global_step)
+                    writer.add_scalar('Loss/Mel_MSE', loss_mse_post.item(), global_step)
                     writer.add_scalar('Loss/L1', loss_l1.item(), global_step)
                     writer.add_scalar('Loss/Stop_BCE', loss_stop.item(), global_step)
                     attn_matrix = attentions[0].detach().cpu().numpy()  # Формат: (T_dec, T_enc)
@@ -693,7 +654,7 @@ def train_with_distillation(root_dir):
                     writer.add_figure('Attention_Alignment', fig, global_step)
 
                     print(
-                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | Mel: {loss_mse.item():.6f} | L1: {loss_l1.item():.6f}| Stop: {loss_stop.item():.6f} | Guide: {loss_guide.item():.6f}")
+                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | Mel: {loss_mse_post.item():.6f} | L1: {loss_l1.item():.6f}| Stop: {loss_stop.item():.6f} | Guide: {loss_guide.item():.6f}")
 
                 # Сохранение чекпоинта
                 if global_step % 250 == 0:
@@ -732,28 +693,23 @@ def inference(model, text, ref_audio_path, cfg, processor):
     tokens = torch.tensor([processor.encode(text)], dtype=torch.long).to(cfg.device)
     lens = torch.tensor([tokens.size(1)]).to(cfg.device)
 
-    # 1. Извлекаем голос (нужен 16k для SpeechBrain)
     signal, fs = torchaudio.load(ref_audio_path)
     if fs != 16000:
         resampler = torchaudio.transforms.Resample(orig_freq=fs, new_freq=16000)
         signal = resampler(signal)
 
     with torch.no_grad():
-        # SpeechBrain classifier внутри себя ожидает, что аудио на CPU или том же устройстве
-        # Перенесем сигнал на девайс конфига
         signal = signal.to(cfg.device)
-        spk_emb = spk_classifier.encode_batch(signal).squeeze(0).squeeze(0)  # (192,)
+        spk_emb = spk_classifier.encode_batch(signal).squeeze(0).squeeze(0)
 
-    # 2. Инференс модели
+    # 2. Инференс модели (НОВОЕ: забираем второй аргумент)
     with torch.no_grad():
-        # Добавляем размерность батча для эмбеддинга: (1, 192)
-        mel, _, _ = model(tokens, lens, speaker_embs=spk_emb.unsqueeze(0))
+        mel_raw, mel_post, _, _ = model(tokens, lens, speaker_embs=spk_emb.unsqueeze(0))
 
-    return mel
-
+    # Возвращаем именно mel_post!
+    return mel_post
 
 import torchaudio
-
 
 def save_audio_vocos(mel_output, filename="output_vocos.wav", device="cuda"):
     """
@@ -781,9 +737,3 @@ if __name__ == "__main__":
 
     print("Starting training on Russian dataset...")
     train_with_distillation("C:/Users/light/Downloads/podcasts_1_stripped_archive/podcasts_1_stripped/test")
-
-    # # Тест инференса
-    # model = StudentTTS(cfg).to(cfg.device)
-    # test_text = "Проверка генерации голоса."
-    # result_mel = inference(model, test_text, cfg, tp)
-    # print(f"Inference success. Mel shape: {result_mel.shape}")

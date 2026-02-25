@@ -143,7 +143,7 @@ if __name__ == "__main__":
     student = StudentTTS(cfg).to("cpu")
 
     # Загрузка чекпоинта (того, что обучался с X-векторами!)
-    ckpt_path = "checp_old/student_step_9500.pth"
+    ckpt_path = "checp_old/student_step_9500_good_before.pth"
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         student.load_state_dict(ckpt['model_state_dict'])

@@ -89,55 +89,49 @@ def generate_zero_shot(
     # 1. Подготовка текста
     tokens = torch.tensor([processor.encode(text)], dtype=torch.long).to(device)
     lens = torch.tensor([tokens.size(1)]).to(device)
-    print(tokens)
+
     # 2. Подготовка голоса
-    print(f"🎤 Читаем голос из: {ref_audio_path}")
     spk_emb = extract_speaker_embedding(ref_audio_path, spk_encoder, device)
 
-    print("🤖 Генерация спектрограммы...")
+    print("🤖 Генерация спектрограммы (с учетом Post-Net)...")
     with torch.no_grad():
-        # Получаем выход модели
-        # mel_output: [1, Time, 100]
-        # stop_output: [1, Time, 1]
-        mel_output, stop_output, attentions = student_model(tokens, lens, speaker_embs=spk_emb)
+        # НОВОЕ: Распаковываем 4 значения.
+        # Нам нужен именно mel_post для финального качества.
+        mel_raw, mel_post, stop_output, attentions = student_model(tokens, lens, speaker_embs=spk_emb)
 
-    # 3. Визуализация Attention
+    # 3. Визуализация Attention (берем из того же места)
     save_attention_image(attentions[0], "inference_attention.png")
 
     # 4. Логика Stop Token
-    stop_probs = torch.sigmoid(stop_output[0]).cpu().numpy()  # [Time, 1]
-
+    stop_probs = torch.sigmoid(stop_output[0]).cpu().numpy()
     stop_threshold = 0.5
-    min_frames = 50  # Не останавливаться раньше ~0.5 сек
+    min_frames = 50
 
-    # Ищем, где вероятность остановки превысила порог
+    # Ищем индекс остановки
     stop_indices = np.where(stop_probs[min_frames:] > stop_threshold)[0]
+
+    # Работаем теперь с mel_post
+    final_mel = mel_post
 
     if len(stop_indices) > 0:
         cut_idx = stop_indices[0] + min_frames
         print(f"✂️ Обрезка по Stop Token на кадре {cut_idx}")
-        mel_output = mel_output[:, :cut_idx, :]
+        final_mel = final_mel[:, :cut_idx, :]
     else:
-        print("⚠️ Stop Token не сработал, генерируем полную длину.")
+        print("⚠️ Stop Token не сработал во внешнем цикле, используем длину из модели.")
 
     # 5. Синтез звука через Vocos
-    print("🔊 Синтез аудио (Vocos)...")
+    print("🔊 Синтез аудио (Vocos) из Post-Net выхода...")
 
-    # ВАЖНО:
-    # Модель выдала [1, Time, 100]
-    # Vocos ожидает [1, 100, Time]
-    features = mel_output.transpose(1, 2)
-
-    # ВНИМАНИЕ: Мы НЕ делаем денормализацию ((x*80)-80),
-    # так как модель училась предсказывать чистые признаки Vocos.
+    # Транспонируем именно финальный (улучшенный) мел
+    features = final_mel.transpose(1, 2)
 
     with torch.no_grad():
         wav = vocoder.decode(features)
         wav = wav.squeeze().cpu().numpy()
 
-    # Сохраняем (Vocos 24khz)
     sf.write(output_path, wav, 24000)
-    print(f"✅ Готово! Аудио сохранено в: {output_path}")
+    print(f"✅ Готово! Аудио сохранено: {output_path}")
 
 
 if __name__ == "__main__":
@@ -155,7 +149,7 @@ if __name__ == "__main__":
 
     # Укажи путь к НОВОМУ чекпоинту (обученному на Vocos данных)
     # Старые чекпоинты (обученные на librosa) работать НЕ БУДУТ
-    ckpt_path = "checkpoints/student_step_9500.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
+    ckpt_path = "checkpoints/student_step_13500.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
 
     if os.path.exists(ckpt_path):
         print(f"📂 Загрузка весов из {ckpt_path}")
@@ -168,11 +162,11 @@ if __name__ == "__main__":
     vocoder, spk_encoder = load_models(cfg, device=device)
 
     # 3. Данные для теста
-    test_text = "Привет! Это тест нового метода генерации звука."
+    test_text = "Я говорю обычную речь."
 
     # Путь к файлу с голосом (любой wav/mp3)
+    # ref_audio = r"C:\Users\light\Downloads\podcasts_1_stripped_archive\podcasts_1_stripped\test\100605980\100605980_1.mp3"
     ref_audio = "samples/audio_2026-02-16_01-29-54.wav"
-
     # Если файла нет, создадим шум для теста (чтобы код не упал)
     if not os.path.exists(ref_audio):
         print("Создаю временный файл голоса для теста...")
@@ -186,6 +180,6 @@ if __name__ == "__main__":
         ref_audio,
         cfg,
         tp,
-        output_path="result_vocos.wav",
+        output_path="result_vocos3.wav",
         device=device
     )
