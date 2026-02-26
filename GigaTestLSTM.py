@@ -746,31 +746,6 @@ def train_with_distillation(root_dir):
         pass
     print("Обучение завершено.")
 
-
-# ==========================================
-# 10. Inference & Main
-# ==========================================
-# def inference(model, text, ref_audio_path, cfg, processor):
-#     model.eval()
-#     tokens = torch.tensor([processor.encode(text)], dtype=torch.long).to(cfg.device)
-#     lens = torch.tensor([tokens.size(1)]).to(cfg.device)
-#
-#     signal, fs = torchaudio.load(ref_audio_path)
-#     if fs != 16000:
-#         resampler = torchaudio.transforms.Resample(orig_freq=fs, new_freq=16000)
-#         signal = resampler(signal)
-#
-#     with torch.no_grad():
-#         signal = signal.to(cfg.device)
-#         spk_emb = spk_classifier.encode_batch(signal).squeeze(0).squeeze(0)
-#
-#     # 2. Инференс модели (НОВОЕ: забираем второй аргумент)
-#     with torch.no_grad():
-#         mel_raw, mel_post, _, _ = model(tokens, lens, speaker_embs=spk_emb.unsqueeze(0))
-#
-#     # Возвращаем именно mel_post!
-#     return mel_post
-
 import torchaudio
 
 def save_audio_vocos(mel_output, filename="output_vocos.wav", device="cuda"):
