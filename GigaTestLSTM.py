@@ -633,14 +633,33 @@ def train_with_distillation(root_dir):
 
                 stop_targets = torch.zeros_like(p_stop)
                 for i, length in enumerate(gt_lens):
-                    if length < min_len:
-                        stop_targets[i, length:, 0] = 1.0
+                    # length.item() даст число. Берем max(0, length - 1), чтобы избежать индекса -1
+                    last_valid_frame = max(0, length.item() - 1)
+                    # Ставим 1 на последний кадр звука и на весь последующий паддинг
+                    stop_targets[i, last_valid_frame:, 0] = 1.0
 
-                loss_stop = bce_loss(p_stop, stop_targets).mean()
+                # Рассчитываем динамический вес позитивного класса для текущего батча
+                num_positives = stop_targets.sum()
+                num_negatives = stop_targets.numel() - num_positives
+
+                if num_positives > 0:
+                    # Ограничим максимальный вес, чтобы градиенты не взорвались
+                    dynamic_weight = torch.clamp(num_negatives / num_positives, max=100.0)
+                else:
+                    dynamic_weight = torch.tensor(1.0).to(cfg.device)
+
+                # Обновляем функцию потерь с новым весом (придется создавать ее заново на каждом шаге,
+                # либо использовать F.binary_cross_entropy_with_logits напрямую)
+                loss_stop = F.binary_cross_entropy_with_logits(
+                    p_stop,
+                    stop_targets,
+                    pos_weight=dynamic_weight,
+                    reduction='mean'
+                )
                 loss_guide = guided_attention_loss(attentions, token_lens, gt_lens)
 
                 loss = (cfg.alpha * loss_mse_raw) + (cfg.alpha * loss_mse_post) + (cfg.beta * loss_l1) + loss_stop + (
-                            10.0 * loss_guide)
+                            1 * loss_guide)
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
