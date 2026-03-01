@@ -4,11 +4,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import json
 from pathlib import Path
-from torch.utils.tensorboard import SummaryWriter
-import os
 from vocos import Vocos  # <--- ВАЖНО: Используем Vocos для инференса
 from speechbrain.inference.speaker import EncoderClassifier
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Инициализируем экстрактор голоса (скачается автоматически при первом запуске)
 # Используем ECAPA-TDNN, он выдает вектор размерностью 192
@@ -17,9 +14,6 @@ spk_classifier = EncoderClassifier.from_hparams(
     source="speechbrain/spkrec-ecapa-voxceleb",
     run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"}
 )
-# ==========================================
-# 1. Hyperparameters & Config
-# ==========================================
 class PodcastDistillDataset(Dataset):
     def __init__(self, root_dir, text_processor, cfg):
         self.root_dir = Path(root_dir)
@@ -87,10 +81,8 @@ class PodcastDistillDataset(Dataset):
 
         # 1. Загрузка Mel-спектрограммы (Target)
         if os.path.exists(sample["teacher_mel_path"]):
-            # Грузим готовый тензор [Time, 100], который ты создал
             target_mel = torch.load(sample["teacher_mel_path"])
         else:
-            # Если нет файла, генерим (медленно)
             target_mel = self._get_mel_from_audio(sample["audio_path"])
 
         # 2. Извлечение вектора голоса (Speaker Embedding)
@@ -113,19 +105,18 @@ class PodcastDistillDataset(Dataset):
 
 import matplotlib.pyplot as plt
 
-class AudioNormalizer:
-    def __init__(self):
-        # Константы для Vocos (приблизительные, можно уточнить на своем датасете)
-        self.mean = -4.0
-        self.std = 4.0
-
-    def normalize(self, mel):
-        return (mel - self.mean) / self.std
-
-    def denormalize(self, mel):
-        return (mel * self.std) + self.mean
-
-normalizer = AudioNormalizer()
+# class AudioNormalizer:
+#     def __init__(self):
+#         self.mean = -2.1932
+#         self.std = 4.7414
+#
+#     def normalize(self, mel):
+#         return (mel - self.mean) / self.std
+#
+#     def denormalize(self, mel):
+#         return (mel * self.std) + self.mean
+#
+# normalizer = AudioNormalizer()
 
 def save_mel_image(mel, path="mel_spectrogram.png"):
     # Если это тензор PyTorch, переносим на CPU и превращаем в numpy
@@ -166,12 +157,12 @@ class Config:
     hop_length = 256  # Стандарт для Vocos 24khz
     # ---------------------------
 
-    alpha = 0.7  # Вес MSE
-    beta = 0.3  # Вес L1
+    alpha = 1  # Вес MSE
+    beta = 0.1  # Вес L1
 
-    lr = 5e-5
-    batch_size = 16
-    epochs = 200
+    lr = 1e-4
+    batch_size = 24
+    epochs = 50
     device = torch.device("cuda")
 
 
@@ -229,9 +220,6 @@ class LocationSensitiveAttention(nn.Module):
         context = torch.bmm(weights.unsqueeze(1), keys)
         return context, weights
 
-# ==========================================
-# 4. Encoder Module
-# ==========================================
 class Encoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim):
         super().__init__()
@@ -253,16 +241,8 @@ class Encoder(nn.Module):
         outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True)
         return outputs  # (B, T, hidden_dim * 2)
 
-
-# ==========================================
-# 5. Decoder Module
-# ==========================================
 def guided_attention_loss(attentions, text_lens, mel_lens, g=0.2):
-    """
-    attentions: тензор формы (B, T_dec, T_enc)
-    text_lens: реальные длины текстов (B)
-    mel_lens: реальные длины спектрограмм (B)
-    """
+
     B, T_dec, T_enc = attentions.size()
     device = attentions.device
     loss = 0.0
@@ -339,8 +319,7 @@ class PostNet(nn.Module):
         self.dropout = dropout
 
     def forward(self, x):
-        # x приходит из декодера с размерностью [Batch, Time, Mels]
-        # Свертки Conv1d ожидают размерность [Batch, Mels, Time]
+
         x = x.transpose(1, 2)
 
         for i in range(len(self.convolutions) - 1):
@@ -372,7 +351,7 @@ class Decoder(nn.Module):
         self.linear = nn.Linear(self.linear_input_size, n_mels)
         self.stop_linear = nn.Linear(self.linear_input_size, 1)
 
-    def forward(self, encoder_outputs, encoder_mask, spk_emb, teacher_mels=None, max_len=1000):
+    def forward(self, encoder_outputs, encoder_mask, spk_emb, teacher_mels=None, teacher_forcing_ratio=1.0, max_len=1500, stop_threshold=0.5, min_stop_frames=30):
         batch_size = encoder_outputs.size(0)
         device = encoder_outputs.device
         prev_weights = torch.zeros(batch_size, encoder_outputs.size(1)).to(device)
@@ -411,37 +390,31 @@ class Decoder(nn.Module):
             outputs.append(mel_out)
             stop_tokens.append(stop_out)
 
-            # Teacher forcing
             # Teacher forcing c вероятностью (Scheduled Sampling)
             if teacher_mels is None:
-                # Берем вероятность стоп-токена через сигмоиду
                 stop_prob = torch.sigmoid(stop_out)[0].item()
-
-                # Условия остановки:
-                # - Прошло хотя бы 20-30 кадров (чтобы не упасть в самом начале)
-                # - Вероятность конца > 0.5
-                if t > 30 and stop_prob > 0.5:
-                    print(f"DEBUG: Модель решила остановиться на шаге {t}")
+                if t > min_stop_frames and stop_prob > stop_threshold:
+                    print(f"🛑 Модель остановилась на шаге {t} (prob: {stop_prob:.3f})")
                     break
 
             if teacher_mels is not None:
+                # Если мы не в конце последовательности
                 if t < teacher_mels.size(1) - 1:
-                    # НОВОЕ: С вероятностью 25% заставляем модель использовать свой же выход
-                    # (только если мы в режиме обучения и это не первый шаг)
-                    if self.training and t > 0 and torch.rand(1).item() < 0.5:
-                        mel_input = mel_out.detach()  # Отрываем от графа, чтобы не взорвать память
-                    else:
+                    # Решаем, что подать на вход на СЛЕДУЮЩЕМ шаге
+                    if torch.rand(1).item() < teacher_forcing_ratio:
+                        # Берем ПРАВИЛЬНЫЙ кадр (Ground Truth)
                         mel_input = teacher_mels[:, t, :]
+                    else:
+                        # Берем ТО, ЧТО ТОЛЬКО ЧТО ПРЕДСКАЗАЛИ (detach обязательно!)
+                        mel_input = mel_out.detach()
                 else:
                     mel_input = mel_out
             else:
+                # Инференс (всегда берем свой выход)
                 mel_input = mel_out
 
         return torch.stack(outputs, dim=1), torch.stack(stop_tokens, dim=1), torch.stack(attentions, dim=1)
 
-# ==========================================
-# 6. Student TTS Model
-# ==========================================
 class StudentTTS(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -456,22 +429,25 @@ class StudentTTS(nn.Module):
         )
         self.postnet = PostNet(n_mels=cfg.n_mels)
 
-    def forward(self, text, text_lengths, speaker_embs, mels=None):
+    def forward(self, text, text_lengths, speaker_embs, mels=None, teacher_forcing_ratio=1.0, stop_threshold=0.5, min_stop_frames=30):
         device = text.device
         mask = torch.arange(text.size(1), device=device).expand(len(text_lengths),
                                                                 text.size(1)) < text_lengths.unsqueeze(1)
 
         encoder_outputs = self.encoder(text, text_lengths)
-        mel_outputs, stop_outputs, attentions = self.decoder(encoder_outputs, mask, speaker_embs, teacher_mels=mels)
-
+        mel_outputs, stop_outputs, attentions = self.decoder(
+            encoder_outputs, mask, speaker_embs,
+            teacher_mels=mels,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+            stop_threshold=stop_threshold,  # <--- Передали в декодер
+            min_stop_frames=min_stop_frames  # <--- Передали в декодер
+        )
         # --- НОВОЕ: Пропускаем через Post-Net и прибавляем к сырому выходу ---
         mel_outputs_post = mel_outputs + self.postnet(mel_outputs)
 
         # Возвращаем 4 значения (сырой мел и улучшенный мел)
         return mel_outputs, mel_outputs_post, stop_outputs, attentions
-# ==========================================
-# 8. Dataset & Collate
-# ==========================================
+
 class RussianTTSDataset(Dataset):
     def __init__(self, texts, gt_mels, teacher_mels, processor):
         self.texts = texts
@@ -496,9 +472,7 @@ def save_checkpoint(model, optimizer, epoch, global_step, loss, path):
     }
     torch.save(checkpoint, path)
     print(f"--- Чекпоинт сохранен: {path} ---")
-# ==========================================
-# 3. Обновленный Collate и Training Loop
-# ==========================================
+
 def collate_fn_podcast(batch):
     # Сортировка для падинга (по убыванию длины текста)
     batch.sort(key=lambda x: len(x[0]), reverse=True)
@@ -542,24 +516,33 @@ def train_with_distillation(root_dir):
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, collate_fn=collate_fn_podcast, shuffle=True)
 
     student = StudentTTS(cfg).to(cfg.device)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=1e-6)
+    # 2. Определяем функцию шедулера (Noam-style, но проще)
+    def get_scheduler(optimizer, warmup_steps, total_steps):
+        def lr_lambda(current_step):
+            # Если шаг меньше warmup - растем линейно
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            # После warmup - убываем (Cosine Annealing)
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    # --- НОВОЕ: Инициализация ReduceLROnPlateau ---
-    # mode='min' -> мы хотим, чтобы метрика (loss) уменьшалась
-    # factor=0.5 -> уменьшаем LR в 2 раза
-    # patience=3 -> ждем 3 эпохи. Если за 3 эпохи loss не стал меньше лучшего результата, режем LR
-    # min_lr=1e-6 -> нижний порог, чтобы LR не упал до абсолютного нуля
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, min_lr=5e-6
-    )
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    import math
+
+    # Настройка:
+    warmup_steps = 1500  # Примерно 1-2 эпохи
+    total_steps = cfg.epochs * len(dataloader)  # Общее число шагов
+
+    scheduler = get_scheduler(optimizer, warmup_steps, total_steps)
 
     writer = SummaryWriter(log_dir="runs/fast_distill_v2")
 
-    bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([15.0]).to(cfg.device), reduction='none')
+    # bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([15.0]).to(cfg.device), reduction='none')
 
     global_step = 0
     start_epoch = 0
-
     # --- Загрузка чекпоинта ---
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -594,10 +577,18 @@ def train_with_distillation(root_dir):
     student.train()
 
     try:
+        tf_start = 1.0  # Начинаем с полной помощи
+        tf_end = 0.0  # В конце полностью самостоятельная (можно оставить 0.1 для стабильности)
+        tf_decay_steps = 50000  # За сколько шагов спуститься до минимума
         for epoch in range(start_epoch, cfg.epochs):
 
             # --- НОВОЕ: Переменные для подсчета среднего лосса за эпоху ---
             epoch_loss_sum = 0.0
+            epoch_loss_mse_raw_sum = 0.0
+            epoch_loss_mse_post_sum = 0.0
+            epoch_loss_l1_sum = 0.0
+            epoch_loss_guide_sum = 0.0
+
             num_batches = 0
 
             for batch in dataloader:
@@ -611,10 +602,16 @@ def train_with_distillation(root_dir):
 
                 target_mels = gts
 
+                current_tf_ratio = max(tf_end, tf_start - (tf_start - tf_end) * (global_step / tf_decay_steps))
+
                 optimizer.zero_grad()
 
+                # Передаем в модель
                 pred_mels_raw, pred_mels_post, pred_stops, attentions = student(
-                    tokens, token_lens, speaker_embs=speaker_ids, mels=target_mels
+                    tokens, token_lens,
+                    speaker_embs=speaker_ids,
+                    mels=target_mels,
+                    teacher_forcing_ratio=current_tf_ratio  # <--- НОВЫЙ АРГУМЕНТ
                 )
 
                 min_len = min(pred_mels_raw.size(1), target_mels.size(1))
@@ -648,6 +645,10 @@ def train_with_distillation(root_dir):
                 else:
                     dynamic_weight = torch.tensor(1.0).to(cfg.device)
 
+                # Логируем в Tensorboard, чтобы видеть прогресс
+                if global_step % 100 == 0:
+                    writer.add_scalar('Training/Teacher_Forcing_Ratio', current_tf_ratio, global_step)
+
                 # Обновляем функцию потерь с новым весом (придется создавать ее заново на каждом шаге,
                 # либо использовать F.binary_cross_entropy_with_logits напрямую)
                 loss_stop = F.binary_cross_entropy_with_logits(
@@ -656,27 +657,56 @@ def train_with_distillation(root_dir):
                     pos_weight=dynamic_weight,
                     reduction='mean'
                 )
+
                 loss_guide = guided_attention_loss(attentions, token_lens, gt_lens)
 
-                loss = (cfg.alpha * loss_mse_raw) + (cfg.alpha * loss_mse_post) + (cfg.beta * loss_l1) + loss_stop + (
-                            1 * loss_guide)
+
+
+                if global_step < 10000:
+                    w_guide = 100
+                    mse_coeff = cfg.alpha
+                    l1_coeff = cfg.beta
+                elif global_step < 21000:
+                    w_guide = 50
+                    mse_coeff = cfg.alpha
+                    l1_coeff = 0.5
+                elif global_step < 22000:
+                    w_guide = 25
+                elif global_step < 23000:
+                    w_guide = 12
+                elif global_step < 24000:
+                    w_guide = 6
+                elif global_step < 25000:
+                    w_guide = 3
+                elif global_step < 27500:
+                    w_guide = 1
+
+
+                loss = (mse_coeff * loss_mse_raw) + (mse_coeff * loss_mse_post) + (l1_coeff * loss_l1) + loss_stop + (
+                            w_guide * loss_guide)
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()  # <--- Сдвигаем LR каждый шаг
 
                 # --- НОВОЕ: Накапливаем лосс ---
                 epoch_loss_sum += loss.item()
+                epoch_loss_mse_raw_sum += loss_mse_raw.item()
+                epoch_loss_mse_post_sum += loss_mse_post.item()
+                epoch_loss_l1_sum += loss_l1.item()
+                epoch_loss_guide_sum += loss_guide.item()
+
                 num_batches += 1
                 global_step += 1
 
                 if global_step % 10 == 0:
                     writer.add_scalar('Loss/Total', loss.item(), global_step)
                     writer.add_scalar('Loss/Guide', loss_guide.item(), global_step)
-                    writer.add_scalar('Loss/Mel_MSE', loss_mse_post.item(), global_step)
+                    writer.add_scalar('Loss/Mel_MSE_RAW', loss_mse_raw.item(), global_step)
+                    writer.add_scalar('Loss/Mel_MSE_POST', loss_mse_post.item(), global_step)
                     writer.add_scalar('Loss/L1', loss_l1.item(), global_step)
                     writer.add_scalar('Loss/Stop_BCE', loss_stop.item(), global_step)
-
                     current_lr = optimizer.param_groups[0]['lr']
                     writer.add_scalar('Training/Learning_Rate', current_lr, global_step)
 
@@ -691,9 +721,9 @@ def train_with_distillation(root_dir):
                     plt.tight_layout()
 
                     writer.add_figure('Attention_Alignment', fig, global_step)
-
+                    plt.close(fig)
                     print(
-                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | Mel: {loss_mse_post.item():.6f} | L1: {loss_l1.item():.6f}| Stop: {loss_stop.item():.6f} | Guide: {loss_guide.item():.6f} | LR: {current_lr:.6e}")
+                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | MSE_raw(multiplied by mse_coeff {mse_coeff}): {loss_mse_raw.item()*mse_coeff:.6f} | MSE_post(multiplied by mse_coeff {mse_coeff}): {loss_mse_post.item()*mse_coeff:.6f} | L1(multiplied by l1_coeff {l1_coeff}): {loss_l1.item()*l1_coeff:.6f}| Stop: {loss_stop.item():.6f} | Guide: {loss_guide.item():.6f} | LR: {current_lr:.6e} | Current_guide_weight: {w_guide:.6f}")
 
                     # Сохранение чекпоинта
                     if global_step % 250 == 0:
@@ -718,13 +748,13 @@ def train_with_distillation(root_dir):
             # --- НОВОЕ: Шаг шедулера в конце эпохи ---
             # Вычисляем средний лосс за всю эпоху
             avg_epoch_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
-
-            # Передаем средний лосс в шедулер. Он сравнит его с лучшим (минимальным)
-            # сохраненным лоссом и решит, резать LR или нет.
-            scheduler.step(avg_epoch_loss)
+            avg_mse_raw_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
+            avg_mse_post_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
+            avg_l1_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
+            avg_guide_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
 
             print(
-                f"🔻 Эпоха {epoch} завершена. Средний лосс: {avg_epoch_loss:.6f}. Текущий LR: {optimizer.param_groups[0]['lr']:.6e}")
+                f"🔻 Эпоха {epoch} завершена. Средние лоссы за эпоху: Total_avg {avg_epoch_loss:.6f} | avg_mse_raw_loss {avg_mse_raw_loss:.6f} | avg_mse_post_loss {avg_mse_post_loss:.6f} | avg_l1_loss {avg_l1_loss:.6f} | avg_guide_los {avg_guide_loss:.6f} Текущий LR: {optimizer.param_groups[0]['lr']:.6e}")
 
     except KeyboardInterrupt:
         print("\nОстановка обучения пользователем...")

@@ -6,13 +6,12 @@ import os
 import matplotlib.pyplot as plt
 from vocos import Vocos
 from speechbrain.inference.speaker import EncoderClassifier
-
+import time
 # Импортируем твои классы из файла обучения
 # Убедись, что файл называется GigaTestLSTM.py или измени импорт
-from GigaTestLSTM import Config, TextProcessor, StudentTTS, AudioNormalizer
+from GigaTestLSTM import Config, TextProcessor, StudentTTS
 
-# Создаем экземпляр (параметры mean/std должны быть ТАКИМИ ЖЕ, как при обучении)
-normalizer = AudioNormalizer()
+
 # ==========================================
 # 1. Загрузка вспомогательных моделей
 # ==========================================
@@ -95,41 +94,31 @@ def generate_zero_shot(
     spk_emb = extract_speaker_embedding(ref_audio_path, spk_encoder, device)
 
     print("🤖 Генерация спектрограммы (с учетом Post-Net)...")
+    print(f"Spk Emb Shape: {spk_emb.shape}")
     with torch.no_grad():
-        # НОВОЕ: Распаковываем 4 значения.
-        # Нам нужен именно mel_post для финального качества.
-        mel_raw, mel_post, stop_output, attentions = student_model(tokens, lens, speaker_embs=spk_emb)
+        # Просто передаем нужные пороги при вызове модели
+        mel_raw, mel_post, stop_output, attentions = student_model(
+            tokens,
+            lens,
+            speaker_embs=spk_emb,
+            stop_threshold=0.1,  # Выставляй тут любую чувствительность
+            min_stop_frames=50  # Минимум полсекунды звука
+        )
 
     # 3. Визуализация Attention (берем из того же места)
-    save_attention_image(attentions[0], "inference_attention.png")
+    save_attention_image(attentions[0], f"{output_path[:len(output_path)-4]}_inference_attention.png")
 
-    # 4. Логика Stop Token
     # 4. Логика Stop Token
     stop_probs = torch.sigmoid(stop_output[0]).cpu().numpy()  # [Time, 1]
 
-    # ДОБАВЬ ЭТО: Посмотрим, насколько модель вообще уверена
+    # Посмотрим, насколько модель вообще уверена
     print(f"📊 Максимальная вероятность стоп-токена за весь файл: {stop_probs.max():.4f}")
-
-    stop_threshold = 0.01  # <--- СНИЗИЛИ ПОРОГ (было 0.5)
-    min_frames = 50  # Не останавливаться раньше ~0.5 сек
-
-    stop_indices = np.where(stop_probs[min_frames:] > stop_threshold)[0]
-
-    # Работаем теперь с mel_post
-    final_mel = mel_post
-
-    if len(stop_indices) > 0:
-        cut_idx = stop_indices[0] + min_frames
-        print(f"✂️ Обрезка по Stop Token на кадре {cut_idx}")
-        final_mel = final_mel[:, :cut_idx, :]
-    else:
-        print("⚠️ Stop Token не сработал во внешнем цикле, используем длину из модели.")
 
     # 5. Синтез звука через Vocos
     print("🔊 Синтез аудио (Vocos) из Post-Net выхода...")
 
-    # Транспонируем именно финальный (улучшенный) мел
-    features = final_mel.transpose(1, 2)
+    # Сразу переходим к Vocos, так как нормализации больше нет
+    features = mel_post.transpose(1, 2)
 
     with torch.no_grad():
         wav = vocoder.decode(features)
@@ -141,7 +130,7 @@ def generate_zero_shot(
 
 if __name__ == "__main__":
     # Выбираем устройство (для инференса лучше CPU, если аудио короткое, или GPU)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     print(f"Используем устройство: {device}")
 
     cfg = Config()
@@ -152,9 +141,8 @@ if __name__ == "__main__":
     # 1. Загрузка Студента
     student = StudentTTS(cfg).to(device)
 
-    # Укажи путь к НОВОМУ чекпоинту (обученному на Vocos данных)
-    # Старые чекпоинты (обученные на librosa) работать НЕ БУДУТ
-    ckpt_path = "checkpoints/student_step_37250.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
+    # Укажи путь к НОВОМУ чекпоинту (обученному на Vocos данных без нормализации)
+    ckpt_path = "checkpoints/student_step_6750.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
 
     if os.path.exists(ckpt_path):
         print(f"📂 Загрузка весов из {ckpt_path}")
@@ -167,24 +155,38 @@ if __name__ == "__main__":
     vocoder, spk_encoder = load_models(cfg, device=device)
 
     # 3. Данные для теста
-    test_text = "Привет, Андрей."
-
+    # test_text = "А если я напишу текст, которого не было в тестовой выборке."
+    test_text = "В этой серии мы говорим о том, как делать ремонт правильно, как добиваться хорошего результата и избежать основных ошибок при его проведении."
     # Путь к файлу с голосом (любой wav/mp3)
-    # ref_audio = r"C:\Users\light\Downloads\podcasts_1_stripped_archive\podcasts_1_stripped\test\100605980\100605980_1.mp3"
-    ref_audio = "samples/audio_2026-02-16_01-29-54.wav"
+    ref_audio_1 = "samples/audio_2026-02-16_01-29-54.wav"
+    ref_audio_2 = r"C:\Users\light\Downloads\podcasts_1_stripped_archive\podcasts_1_stripped\test\100605980\100605980_1.mp3"
     # Если файла нет, создадим шум для теста (чтобы код не упал)
-    if not os.path.exists(ref_audio):
-        print("Создаю временный файл голоса для теста...")
-        sf.write(ref_audio, np.random.uniform(-0.5, 0.5, 16000 * 3), 16000)
+    # if not os.path.exists(ref_audio):
+    #     print("Создаю временный файл голоса для теста.")
+    #     sf.write(ref_audio, np.random.uniform(-0.5, 0.5, 16000 * 3), 16000)
+
     # 4. Запуск
     generate_zero_shot(
         student,
         vocoder,
         spk_encoder,
         test_text,
-        ref_audio,
+        ref_audio_1,
         cfg,
         tp,
-        output_path="result_vocos3.wav",
+        output_path="result_vocos_my_sample.wav",
+        device=device
+    )
+    time.sleep(30)
+
+    generate_zero_shot(
+        student,
+        vocoder,
+        spk_encoder,
+        test_text,
+        ref_audio_2,
+        cfg,
+        tp,
+        output_path="result_vocos_dataset_sample.wav",
         device=device
     )
