@@ -752,7 +752,7 @@ def train_with_distillation(root_dir):
                     writer.add_figure('Attention_Alignment', fig, global_step)
                     plt.close(fig)
                     print(
-                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | MSE_raw(multiplied by mse_coeff {mse_coeff}): {loss_mse_raw.item()*mse_coeff:.6f} | MSE_post(multiplied by mse_coeff {mse_coeff}): {loss_mse_post.item()*mse_coeff:.6f} | L1(multiplied by l1_coeff {l1_coeff}): {loss_l1.item()*l1_coeff:.6f}| Stop: {loss_stop.item():.6f} | Guide: {loss_guide.item():.6f} | LR: {current_lr:.6e} | Current_guide_weight: {w_guide:.6f}")
+                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | MSE_raw(multiplied by mse_coeff {mse_coeff}): {loss_mse_raw.item()*mse_coeff:.6f} | MSE_post(multiplied by mse_coeff {mse_coeff}): {loss_mse_post.item()*mse_coeff:.6f} | L1(multiplied by l1_coeff {l1_coeff}): {loss_l1.item()*l1_coeff:.6f}| Stop: {loss_stop.item():.6f} | Guide(multiplied by Current_guide_weight ): {loss_guide.item()*w_guide:.6f} | LR: {current_lr:.6e} | Current_guide_weight: {w_guide:.6f}")
 
                     # Сохранение чекпоинта
                     if global_step % 250 == 0:

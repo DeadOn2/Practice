@@ -101,7 +101,7 @@ def generate_zero_shot(
             tokens,
             lens,
             speaker_embs=spk_emb,
-            stop_threshold=0.0001,  # Выставляй тут любую чувствительность
+            stop_threshold=0.5,  # Выставляй тут любую чувствительность
             min_stop_frames=50  # Минимум полсекунды звука
         )
 
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         output_path="result_vocos_my_sample.wav",
         device=device
     )
-    time.sleep(15)
+    time.sleep(10)
 
     generate_zero_shot(
         student,
