@@ -101,7 +101,7 @@ def generate_zero_shot(
             tokens,
             lens,
             speaker_embs=spk_emb,
-            stop_threshold=0.02,  # Выставляй тут любую чувствительность
+            stop_threshold=0.0001,  # Выставляй тут любую чувствительность
             min_stop_frames=50  # Минимум полсекунды звука
         )
 
@@ -112,7 +112,7 @@ def generate_zero_shot(
     stop_probs = torch.sigmoid(stop_output[0]).cpu().numpy()  # [Time, 1]
 
     # Посмотрим, насколько модель вообще уверена
-    print(f"📊 Максимальная вероятность стоп-токена за весь файл: {stop_probs.max():.4f}")
+    print(f"📊 Максимальная вероятность стоп-токена за весь файл: {stop_probs.max():.6f}")
 
     # 5. Синтез звука через Vocos
     print("🔊 Синтез аудио (Vocos) из Post-Net выхода...")
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     student = StudentTTS(cfg).to(device)
 
     # Укажи путь к НОВОМУ чекпоинту (обученному на Vocos данных без нормализации)
-    ckpt_path = "checkpoints/student_step_20000.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
+    ckpt_path = "checkpoints/student_step_8750.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
 
     if os.path.exists(ckpt_path):
         print(f"📂 Загрузка весов из {ckpt_path}")

@@ -162,7 +162,7 @@ class Config:
 
     lr = 1e-4
     batch_size = 24
-    epochs = 50
+    epochs = 30
     device = torch.device("cuda")
 
 
@@ -287,50 +287,42 @@ class PreNet(nn.Module):
 class PostNet(nn.Module):
     def __init__(self, n_mels=100, postnet_embedding_dim=512, kernel_size=5, dropout=0.1):
         super().__init__()
-
         self.convolutions = nn.ModuleList()
-
-        # Первый слой (in: n_mels, out: 512)
         self.convolutions.append(
             nn.Sequential(
-                nn.Conv1d(n_mels, postnet_embedding_dim, kernel_size, stride=1, padding=int((kernel_size - 1) / 2)),
+                nn.Conv1d(n_mels, postnet_embedding_dim, kernel_size, stride=1, padding=5 // 2),
                 nn.BatchNorm1d(postnet_embedding_dim)
             )
         )
-
-        # Средние 3 слоя (in: 512, out: 512)
         for _ in range(3):
             self.convolutions.append(
                 nn.Sequential(
-                    nn.Conv1d(postnet_embedding_dim, postnet_embedding_dim, kernel_size, stride=1,
-                              padding=int((kernel_size - 1) / 2)),
+                    nn.Conv1d(postnet_embedding_dim, postnet_embedding_dim, kernel_size, stride=1, padding=5 // 2),
                     nn.BatchNorm1d(postnet_embedding_dim)
                 )
             )
-
-        # Последний слой (in: 512, out: n_mels) - БЕЗ активации в конце
         self.convolutions.append(
             nn.Sequential(
-                nn.Conv1d(postnet_embedding_dim, n_mels, kernel_size, stride=1, padding=int((kernel_size - 1) / 2)),
+                nn.Conv1d(postnet_embedding_dim, n_mels, kernel_size, stride=1, padding=5 // 2),
                 nn.BatchNorm1d(n_mels)
             )
         )
-
         self.dropout = dropout
 
-    def forward(self, x):
-
+    def forward(self, x, mask=None):
+        # x: [B, T, Mels] -> [B, Mels, T]
         x = x.transpose(1, 2)
 
         for i in range(len(self.convolutions) - 1):
             x = F.dropout(torch.tanh(self.convolutions[i](x)), p=self.dropout, training=self.training)
+            if mask is not None:
+                x = x * mask.unsqueeze(1)  # Обнуляем паддинги после каждого слоя!
 
-        # Последний слой без Tanh
         x = F.dropout(self.convolutions[-1](x), p=self.dropout, training=self.training)
+        if mask is not None:
+            x = x * mask.unsqueeze(1)
 
-        # Возвращаем к размерности [Batch, Time, Mels]
-        x = x.transpose(1, 2)
-        return x
+        return x.transpose(1, 2)
 
 class Decoder(nn.Module):
     def __init__(self, n_mels, decoder_hidden, encoder_total_dim, attention_dim, speaker_dim):
@@ -395,7 +387,7 @@ class Decoder(nn.Module):
             if teacher_mels is None:
                 stop_prob = torch.sigmoid(stop_out)[0].item()
                 if t > min_stop_frames and stop_prob > stop_threshold:
-                    print(f"🛑 Модель остановилась на шаге {t} (prob: {stop_prob:.3f})")
+                    print(f"🛑 Модель остановилась на шаге {t} (prob: {stop_prob:.6f})")
                     break
 
             if teacher_mels is not None:
@@ -416,6 +408,7 @@ class Decoder(nn.Module):
 
         return torch.stack(outputs, dim=1), torch.stack(stop_tokens, dim=1), torch.stack(attentions, dim=1)
 
+
 class StudentTTS(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -425,28 +418,45 @@ class StudentTTS(nn.Module):
             cfg.decoder_hidden,
             cfg.encoder_hidden * 2,
             cfg.attention_dim,
-            # УДАЛИЛИ: num_speakers
             speaker_dim=cfg.speaker_embedding_dim
         )
         self.postnet = PostNet(n_mels=cfg.n_mels)
 
-    def forward(self, text, text_lengths, speaker_embs, mels=None, teacher_forcing_ratio=1.0, stop_threshold=0.5, min_stop_frames=30):
+    # ДОБАВЛЕНО: mel_lengths в аргументы
+    def forward(self, text, text_lengths, speaker_embs, mel_lengths=None, mels=None,
+                teacher_forcing_ratio=1.0, stop_threshold=0.5, min_stop_frames=30):
+
         device = text.device
-        mask = torch.arange(text.size(1), device=device).expand(len(text_lengths),
-                                                                text.size(1)) < text_lengths.unsqueeze(1)
+
+        # Маска для энкодера (текст)
+        encoder_mask = torch.arange(text.size(1), device=device).expand(
+            len(text_lengths), text.size(1)) < text_lengths.unsqueeze(1)
 
         encoder_outputs = self.encoder(text, text_lengths)
+
+        # 1. Получаем сырой выход из декодера
         mel_outputs, stop_outputs, attentions = self.decoder(
-            encoder_outputs, mask, speaker_embs,
+            encoder_outputs, encoder_mask, speaker_embs,
             teacher_mels=mels,
             teacher_forcing_ratio=teacher_forcing_ratio,
-            stop_threshold=stop_threshold,  # <--- Передали в декодер
-            min_stop_frames=min_stop_frames  # <--- Передали в декодер
+            stop_threshold=stop_threshold,
+            min_stop_frames=min_stop_frames
         )
-        # --- НОВОЕ: Пропускаем через Post-Net и прибавляем к сырому выходу ---
-        mel_outputs_post = mel_outputs + self.postnet(mel_outputs)
 
-        # Возвращаем 4 значения (сырой мел и улучшенный мел)
+        # 2. Создаем маску для PostNet на основе длин аудио (mel_lengths)
+        # Если длины не переданы (например, при инференсе), создаем маску из единиц
+        if mel_lengths is not None:
+            mel_mask = torch.arange(mel_outputs.size(1), device=device).expand(
+                len(mel_lengths), mel_outputs.size(1)) < mel_lengths.unsqueeze(1)
+        else:
+            # Для инференса маскируем по факту генерации
+            mel_mask = torch.ones(mel_outputs.shape[0], mel_outputs.shape[1],
+                                  device=device, dtype=torch.bool)
+
+        # 3. Передаем маску в PostNet (как мы обсуждали ранее)
+        # Важно приводить к float() для умножения
+        mel_outputs_post = mel_outputs + self.postnet(mel_outputs, mask=mel_mask.float())
+
         return mel_outputs, mel_outputs_post, stop_outputs, attentions
 
 def save_checkpoint(model, optimizer, epoch, global_step, loss, path):
@@ -494,7 +504,14 @@ def masked_mse_loss(pred, target, lengths):
     loss = F.mse_loss(pred, target, reduction='none')
     loss = (loss * mask.float()).sum() / mask.sum()  # Среднее только по живым кадрам
     return loss
-
+def masked_l1_loss(pred, target, lengths):
+    mask = get_mask_from_lengths(lengths, max_len=target.size(1))
+    mask = mask.unsqueeze(-1).expand_as(target)
+    # Считаем L1 (MAE)
+    loss = F.l1_loss(pred, target, reduction='none')
+    # Усредняем только по валидным элементам
+    loss = (loss * mask.float()).sum() / mask.sum()
+    return loss
 import os
 import torch
 import torch.nn as nn
@@ -505,13 +522,6 @@ import matplotlib.pyplot as plt
 
 def train_with_distillation(root_dir):
     # --- Вспомогательные функции Loss ---
-    def masked_mse(preds, targets, mask):
-        diff = (preds - targets) ** 2
-        return (diff * mask).sum() / (mask.sum() * cfg.n_mels + 1e-8)
-
-    def masked_l1(preds, targets, mask):
-        diff = torch.abs(preds - targets)
-        return (diff * mask).sum() / (mask.sum() * cfg.n_mels + 1e-8)
 
     # Конфигурация
     cfg = Config()
@@ -613,10 +623,12 @@ def train_with_distillation(root_dir):
 
                 # Передаем в модель
                 pred_mels_raw, pred_mels_post, pred_stops, attentions = student(
-                    tokens, token_lens,
+                    tokens,
+                    token_lens,
                     speaker_embs=speaker_ids,
+                    mel_lengths=gt_lens,  # <--- ПЕРЕДАЕМ ЗДЕСЬ
                     mels=target_mels,
-                    teacher_forcing_ratio=current_tf_ratio  # <--- НОВЫЙ АРГУМЕНТ
+                    teacher_forcing_ratio=current_tf_ratio
                 )
 
                 min_len = min(pred_mels_raw.size(1), target_mels.size(1))
@@ -626,12 +638,14 @@ def train_with_distillation(root_dir):
                 t_mel = target_mels[:, :min_len, :]
                 p_stop = pred_stops[:, :min_len, :]
 
-                mask = torch.arange(min_len, device=cfg.device).expand(len(gt_lens), min_len) < gt_lens.unsqueeze(1)
-                mask_expanded = mask.unsqueeze(-1).float()
+                # --- ИСПОЛЬЗУЕМ ВАШИ ФУНКЦИИ ---
+                # gt_lens — это реальные длины аудио из батча
+                loss_mse_raw = masked_mse_loss(p_mel_raw, t_mel, gt_lens)
+                loss_mse_post = masked_mse_loss(p_mel_post, t_mel, gt_lens)
 
-                loss_mse_raw = ((p_mel_raw - t_mel) ** 2 * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
-                loss_mse_post = ((p_mel_post - t_mel) ** 2 * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
-                loss_l1 = (torch.abs(p_mel_post - t_mel) * mask_expanded).sum() / (mask.sum() * cfg.n_mels + 1e-8)
+                # Для L1 используем новую функцию (см. пункт 1) ИЛИ комбинацию mask
+                # Если добавили masked_l1_loss:
+                loss_l1 = masked_l1_loss(p_mel_post, t_mel, gt_lens)
 
                 stop_targets = torch.zeros_like(p_stop)
                 for i, length in enumerate(gt_lens):
@@ -667,32 +681,32 @@ def train_with_distillation(root_dir):
 
 
 
-                if global_step < 10000:
-                    w_guide = 100
+                if global_step < 8000:
+                    w_guide = 10
                     mse_coeff = cfg.alpha
                     l1_coeff = cfg.beta
-                elif global_step < 12000:
-                    w_guide = 50
+                elif global_step < 15000:
+                    w_guide = 20
                     mse_coeff = cfg.alpha
-                    l1_coeff = 0.5
-                elif global_step < 13000:
-                    w_guide = 25
+                    l1_coeff = 0.1
+                elif global_step < 17000:
+                    w_guide = 10
                     mse_coeff = cfg.alpha
-                    l1_coeff = 0.5
+                    l1_coeff = 0.1
                 elif global_step < 20000:
-                    w_guide = 12
-                    mse_coeff = 0.5
-                    l1_coeff = 1
+                    w_guide = 5
+                    mse_coeff = 1
+                    l1_coeff = 0.1
                 elif global_step < 25000:
-                    w_guide = 6
+                    w_guide = 0.6
                     mse_coeff = 0.5
                     l1_coeff = 1.0
                 elif global_step < 30000:
-                    w_guide = 3
+                    w_guide = 0.3
                     mse_coeff = 0.5
                     l1_coeff = 1
                 elif global_step < 35000:
-                    w_guide = 1
+                    w_guide = 0.1
                     mse_coeff = cfg.alpha
                     l1_coeff = 0.5
 
