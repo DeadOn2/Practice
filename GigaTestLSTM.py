@@ -401,7 +401,7 @@ class Decoder(nn.Module):
                 # Если мы не в конце последовательности
                 if t < teacher_mels.size(1) - 1:
                     # Решаем, что подать на вход на СЛЕДУЮЩЕМ шаге
-                    if torch.rand(1).item() < teacher_forcing_ratio:
+                    if torch.rand(1).item() < 2:
                         # Берем ПРАВИЛЬНЫЙ кадр (Ground Truth)
                         mel_input = teacher_mels[:, t, :]
                     else:
@@ -447,20 +447,6 @@ class StudentTTS(nn.Module):
 
         # Возвращаем 4 значения (сырой мел и улучшенный мел)
         return mel_outputs, mel_outputs_post, stop_outputs, attentions
-
-class RussianTTSDataset(Dataset):
-    def __init__(self, texts, gt_mels, teacher_mels, processor):
-        self.texts = texts
-        self.gt_mels = gt_mels
-        self.teacher_mels = teacher_mels
-        self.processor = processor
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        tokens = torch.tensor(self.processor.encode(self.texts[idx]), dtype=torch.long)
-        return tokens, self.gt_mels[idx], self.teacher_mels[idx]
 
 def save_checkpoint(model, optimizer, epoch, global_step, loss, path):
     checkpoint = {
@@ -547,10 +533,10 @@ def train_with_distillation(root_dir):
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth') and 'step' in f]
+    checkpoints = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
     if checkpoints:
-        checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-        last_checkpoint = os.path.join(checkpoint_dir, checkpoints[-1])
+        checkpoints.sort(key=os.path.getmtime)
+        last_checkpoint = checkpoints[-1]
         print(f"Загрузка чекпоинта: {last_checkpoint}")
         try:
             ckpt = torch.load(last_checkpoint)
@@ -666,19 +652,19 @@ def train_with_distillation(root_dir):
                     w_guide = 100
                     mse_coeff = cfg.alpha
                     l1_coeff = cfg.beta
-                elif global_step < 21000:
+                elif global_step < 12000:
                     w_guide = 50
                     mse_coeff = cfg.alpha
                     l1_coeff = 0.5
-                elif global_step < 22000:
+                elif global_step < 13000:
                     w_guide = 25
-                elif global_step < 23000:
+                elif global_step < 14000:
                     w_guide = 12
-                elif global_step < 24000:
+                elif global_step < 15000:
                     w_guide = 6
-                elif global_step < 25000:
+                elif global_step < 16000:
                     w_guide = 3
-                elif global_step < 27500:
+                elif global_step < 17500:
                     w_guide = 1
 
 
@@ -748,10 +734,10 @@ def train_with_distillation(root_dir):
             # --- НОВОЕ: Шаг шедулера в конце эпохи ---
             # Вычисляем средний лосс за всю эпоху
             avg_epoch_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
-            avg_mse_raw_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
-            avg_mse_post_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
-            avg_l1_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
-            avg_guide_loss = epoch_loss_sum / num_batches if num_batches > 0 else 0
+            avg_mse_raw_loss = epoch_loss_mse_raw_sum / num_batches if num_batches > 0 else 0
+            avg_mse_post_loss = epoch_loss_mse_post_sum / num_batches if num_batches > 0 else 0
+            avg_l1_loss = epoch_loss_l1_sum / num_batches if num_batches > 0 else 0
+            avg_guide_loss = epoch_loss_guide_sum / num_batches if num_batches > 0 else 0
 
             print(
                 f"🔻 Эпоха {epoch} завершена. Средние лоссы за эпоху: Total_avg {avg_epoch_loss:.6f} | avg_mse_raw_loss {avg_mse_raw_loss:.6f} | avg_mse_post_loss {avg_mse_post_loss:.6f} | avg_l1_loss {avg_l1_loss:.6f} | avg_guide_los {avg_guide_loss:.6f} Текущий LR: {optimizer.param_groups[0]['lr']:.6e}")
