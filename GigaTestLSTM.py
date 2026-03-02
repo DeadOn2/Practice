@@ -685,7 +685,7 @@ def train_with_distillation(root_dir):
                     w_guide = 10
                     mse_coeff = cfg.alpha
                     l1_coeff = cfg.beta
-                elif global_step < 15000:
+                elif global_step < 16000:
                     w_guide = 20
                     mse_coeff = cfg.alpha
                     l1_coeff = 0.1
