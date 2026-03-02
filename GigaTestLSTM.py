@@ -349,6 +349,7 @@ class Decoder(nn.Module):
 
         self.linear_input_size = decoder_hidden + encoder_total_dim + speaker_dim
         self.linear = nn.Linear(self.linear_input_size, n_mels)
+        nn.init.constant_(self.linear.bias, -5.0)
         self.stop_linear = nn.Linear(self.linear_input_size, 1)
 
     def forward(self, encoder_outputs, encoder_mask, spk_emb, teacher_mels=None, teacher_forcing_ratio=1.0, max_len=1500, stop_threshold=0.5, min_stop_frames=30):
@@ -469,12 +470,30 @@ def collate_fn_podcast(batch):
     tokens_padded = nn.utils.rnn.pad_sequence(tokens, batch_first=True)
 
     mel_lens = torch.tensor([x.size(0) for x in mels])
-    mels_padded = nn.utils.rnn.pad_sequence(mels, batch_first=True) # Паддинг нулями - ок для Vocos
-
+    mels_padded = nn.utils.rnn.pad_sequence(mels, batch_first=True, padding_value=-11.5129)
     spk_embs_tensor = torch.stack(spk_embs)
 
     return tokens_padded, token_lens, mels_padded, mel_lens, raw_texts, audio_paths, spk_embs_tensor
 
+
+def get_mask_from_lengths(lengths, max_len=None):
+    if max_len is None:
+        max_len = lengths.max()
+    # Создаем сетку индексов [Batch, Max_Len]
+    ids = torch.arange(0, max_len, device=lengths.device, dtype=torch.long)
+    mask = (ids < lengths.unsqueeze(1)).bool()
+    return mask  # [Batch, Time]
+
+
+def masked_mse_loss(pred, target, lengths):
+    mask = get_mask_from_lengths(lengths, max_len=target.size(1))
+    # Расширяем маску до [Batch, Time, Mels]
+    mask = mask.unsqueeze(-1).expand_as(target)
+
+    # Считаем MSE только там, где маска == True
+    loss = F.mse_loss(pred, target, reduction='none')
+    loss = (loss * mask.float()).sum() / mask.sum()  # Среднее только по живым кадрам
+    return loss
 
 import os
 import torch
@@ -518,7 +537,7 @@ def train_with_distillation(root_dir):
     import math
 
     # Настройка:
-    warmup_steps = 1500  # Примерно 1-2 эпохи
+    warmup_steps = 1000  # Примерно 1-2 эпохи
     total_steps = cfg.epochs * len(dataloader)  # Общее число шагов
 
     scheduler = get_scheduler(optimizer, warmup_steps, total_steps)
@@ -565,7 +584,7 @@ def train_with_distillation(root_dir):
     try:
         tf_start = 1.0  # Начинаем с полной помощи
         tf_end = 0.0  # В конце полностью самостоятельная (можно оставить 0.1 для стабильности)
-        tf_decay_steps = 50000  # За сколько шагов спуститься до минимума
+        tf_decay_steps = 30000  # За сколько шагов спуститься до минимума
         for epoch in range(start_epoch, cfg.epochs):
 
             # --- НОВОЕ: Переменные для подсчета среднего лосса за эпоху ---
@@ -658,14 +677,24 @@ def train_with_distillation(root_dir):
                     l1_coeff = 0.5
                 elif global_step < 13000:
                     w_guide = 25
-                elif global_step < 14000:
+                    mse_coeff = cfg.alpha
+                    l1_coeff = 0.5
+                elif global_step < 20000:
                     w_guide = 12
-                elif global_step < 15000:
+                    mse_coeff = 0.5
+                    l1_coeff = 1
+                elif global_step < 25000:
                     w_guide = 6
-                elif global_step < 16000:
+                    mse_coeff = 0.5
+                    l1_coeff = 1.0
+                elif global_step < 30000:
                     w_guide = 3
-                elif global_step < 17500:
+                    mse_coeff = 0.5
+                    l1_coeff = 1
+                elif global_step < 35000:
                     w_guide = 1
+                    mse_coeff = cfg.alpha
+                    l1_coeff = 0.5
 
 
                 loss = (mse_coeff * loss_mse_raw) + (mse_coeff * loss_mse_post) + (l1_coeff * loss_l1) + loss_stop + (

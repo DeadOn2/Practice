@@ -142,7 +142,7 @@ if __name__ == "__main__":
     student = StudentTTS(cfg).to(device)
 
     # Укажи путь к НОВОМУ чекпоинту (обученному на Vocos данных без нормализации)
-    ckpt_path = "checkpoints/student_step_10000.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
+    ckpt_path = "checkpoints/student_step_20000.pth"  # <--- ПОМЕНЯЙ НА СВОЙ
 
     if os.path.exists(ckpt_path):
         print(f"📂 Загрузка весов из {ckpt_path}")
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         output_path="result_vocos_my_sample.wav",
         device=device
     )
-    time.sleep(30)
+    time.sleep(15)
 
     generate_zero_shot(
         student,

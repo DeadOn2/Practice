@@ -10,7 +10,7 @@ from speechbrain.inference.speaker import EncoderClassifier
 from GigaTestLSTM import Config, TextProcessor, StudentTTS
 
 # ================= НАСТРОЙКИ =================
-CHECKPOINT_PATH = "checkpoints/student_step_10000.pth"  # Твой последний чекпоинт
+CHECKPOINT_PATH = "checkpoints/student_step_21000.pth"  # Твой последний чекпоинт
 TEST_AUDIO_PATH = r"C:\Users\light\Downloads\podcasts_1_stripped_archive\podcasts_1_stripped\test\100605980\100605980_1.mp3"  # УКАЖИ ПУТЬ К ЛЮБОМУ ФАЙЛУ ИЗ ДАТАСЕТА
 TEST_TEXT = "В этой серии мы говорим о том, как делать ремонт правильно, как добиваться хорошего результата и избежать основных ошибок при его проведении."  # Текст этого файла
 DEVICE = "cpu"
@@ -133,6 +133,7 @@ def main():
     # Обрезаем длинный хвост, чтобы удобно смотреть
     min_len = min(target_mel.shape[1], pred_mel.shape[1])
     target_mel = target_mel[:, :min_len]
+    print(f"Min: {target_mel.min()}, Max: {target_mel.max()}")
     pred_mel = pred_mel[:, :min_len]
     print(f"Min: {pred_mel.min()}, Max: {pred_mel.max()}")
     # 5. Рисуем
