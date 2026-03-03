@@ -10,7 +10,7 @@ from speechbrain.inference.speaker import EncoderClassifier
 from GigaTestLSTM import Config, TextProcessor, StudentTTS
 
 # ================= НАСТРОЙКИ =================
-CHECKPOINT_PATH = "checkpoints/student_step_8750.pth"  # Твой последний чекпоинт
+CHECKPOINT_PATH = "checkpoints/student_step_17250.pth"  # Твой последний чекпоинт
 TEST_AUDIO_PATH = r"C:\Users\light\Downloads\podcasts_1_stripped_archive\podcasts_1_stripped\test\100605980\100605980_1.mp3"  # УКАЖИ ПУТЬ К ЛЮБОМУ ФАЙЛУ ИЗ ДАТАСЕТА
 TEST_TEXT = "В этой серии мы говорим о том, как делать ремонт правильно, как добиваться хорошего результата и избежать основных ошибок при его проведении."  # Текст этого файла
 DEVICE = "cpu"

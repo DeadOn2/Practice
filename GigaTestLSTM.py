@@ -162,7 +162,7 @@ class Config:
 
     lr = 1e-4
     batch_size = 24
-    epochs = 30
+    epochs = 50
     device = torch.device("cuda")
 
 
@@ -394,11 +394,13 @@ class Decoder(nn.Module):
                 # Если мы не в конце последовательности
                 if t < teacher_mels.size(1) - 1:
                     # Решаем, что подать на вход на СЛЕДУЮЩЕМ шаге
-                    if torch.rand(1).item() < 2:
+                    if torch.rand(1).item() < teacher_forcing_ratio:
                         # Берем ПРАВИЛЬНЫЙ кадр (Ground Truth)
                         mel_input = teacher_mels[:, t, :]
+
                     else:
                         # Берем ТО, ЧТО ТОЛЬКО ЧТО ПРЕДСКАЗАЛИ (detach обязательно!)
+
                         mel_input = mel_out.detach()
                 else:
                     mel_input = mel_out
@@ -593,8 +595,8 @@ def train_with_distillation(root_dir):
 
     try:
         tf_start = 1.0  # Начинаем с полной помощи
-        tf_end = 0.0  # В конце полностью самостоятельная (можно оставить 0.1 для стабильности)
-        tf_decay_steps = 30000  # За сколько шагов спуститься до минимума
+        tf_end = 0.5  # В конце полностью самостоятельная (можно оставить 0.1 для стабильности)
+        tf_decay_steps = 60000  # За сколько шагов спуститься до минимума
         for epoch in range(start_epoch, cfg.epochs):
 
             # --- НОВОЕ: Переменные для подсчета среднего лосса за эпоху ---
@@ -752,7 +754,7 @@ def train_with_distillation(root_dir):
                     writer.add_figure('Attention_Alignment', fig, global_step)
                     plt.close(fig)
                     print(
-                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | MSE_raw(multiplied by mse_coeff {mse_coeff}): {loss_mse_raw.item()*mse_coeff:.6f} | MSE_post(multiplied by mse_coeff {mse_coeff}): {loss_mse_post.item()*mse_coeff:.6f} | L1(multiplied by l1_coeff {l1_coeff}): {loss_l1.item()*l1_coeff:.6f}| Stop: {loss_stop.item():.6f} | Guide(multiplied by Current_guide_weight ): {loss_guide.item()*w_guide:.6f} | LR: {current_lr:.6e} | Current_guide_weight: {w_guide:.6f}")
+                        f"Epoch {epoch}/{cfg.epochs} | Step {global_step} | Total: {loss.item():.6f} | MSE_raw(multiplied by mse_coeff {mse_coeff}): {loss_mse_raw.item()*mse_coeff:.6f} | MSE_post(multiplied by mse_coeff {mse_coeff}): {loss_mse_post.item()*mse_coeff:.6f} | L1(multiplied by l1_coeff {l1_coeff}): {loss_l1.item()*l1_coeff:.6f}| Stop: {loss_stop.item():.6f} | Guide(multiplied by Current_guide_weight ): {loss_guide.item()*w_guide:.6f} | LR: {current_lr:.6e} | Current_guide_weight: {w_guide:.6f} | teacher_forcing_ratio: {current_tf_ratio}")
 
                     # Сохранение чекпоинта
                     if global_step % 250 == 0:
