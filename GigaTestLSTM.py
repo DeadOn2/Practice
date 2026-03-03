@@ -162,7 +162,7 @@ class Config:
 
     lr = 1e-4
     batch_size = 24
-    epochs = 50
+    epochs = 70
     device = torch.device("cuda")
 
 
@@ -596,7 +596,7 @@ def train_with_distillation(root_dir):
     try:
         tf_start = 1.0  # Начинаем с полной помощи
         tf_end = 0.5  # В конце полностью самостоятельная (можно оставить 0.1 для стабильности)
-        tf_decay_steps = 60000  # За сколько шагов спуститься до минимума
+        tf_decay_steps = 100000   # За сколько шагов спуститься до минимума
         for epoch in range(start_epoch, cfg.epochs):
 
             # --- НОВОЕ: Переменные для подсчета среднего лосса за эпоху ---
